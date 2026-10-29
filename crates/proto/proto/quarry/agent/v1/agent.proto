@@ -1,0 +1,357 @@
+syntax = "proto3";
+
+package quarry.agent.v1;
+
+service AgentGateway
+{
+    rpc Connect(stream AgentMessage) returns (stream ControlMessage);
+    rpc StreamLogs(stream LogChunk) returns (LogStreamSummary);
+    rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message AgentMessage
+{
+    uint64 seq = 1;
+    uint64 ack = 2;
+    oneof body
+    {
+        Hello hello = 10;
+        Heartbeat heartbeat = 11;
+        InstanceStatus status = 12;
+        UsageBatch usage = 13;
+        OperationResult op_result = 14;
+        LeaseRenewal lease = 15;
+    }
+}
+
+message ControlMessage
+{
+    uint64 seq = 1;
+    uint64 ack = 2;
+    oneof body
+    {
+        PutInstance put = 10;
+        DeleteInstance delete = 11;
+        RunOperation op = 12;
+        NetworkConfig network = 13;
+        LeaseGrant lease = 14;
+        AgentUpdate update = 15;
+        DesiredState desired = 16;
+    }
+}
+
+enum Isolation
+{
+    ISOLATION_UNSPECIFIED = 0;
+    ISOLATION_FIRECRACKER = 1;
+    ISOLATION_GVISOR = 2;
+}
+
+enum RestartPolicy
+{
+    RESTART_POLICY_UNSPECIFIED = 0;
+    RESTART_POLICY_ALWAYS = 1;
+    RESTART_POLICY_ON_FAILURE = 2;
+    RESTART_POLICY_NEVER = 3;
+}
+
+enum RunState
+{
+    RUN_STATE_UNSPECIFIED = 0;
+    RUN_STATE_RUNNING = 1;
+    RUN_STATE_STOPPED = 2;
+}
+
+enum Phase
+{
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PENDING = 1;
+    PHASE_PREPARING = 2;
+    PHASE_BOOTING = 3;
+    PHASE_STARTING = 4;
+    PHASE_RUNNING = 5;
+    PHASE_STOPPING = 6;
+    PHASE_STOPPED = 7;
+    PHASE_FAILED = 8;
+    PHASE_DELETING = 9;
+    PHASE_DELETED = 10;
+    PHASE_REJECTED = 11;
+}
+
+message Resources
+{
+    uint32 vcpus = 1;
+    uint64 memory_mib = 2;
+    uint64 disk_gib = 3;
+}
+
+message Capabilities
+{
+    bool kvm = 1;
+    repeated Isolation isolations = 2;
+    string arch = 3;
+    string wireguard_public_key = 4;
+}
+
+message InventoryEntry
+{
+    string instance_id = 1;
+    uint64 observed_generation = 2;
+    Phase phase = 3;
+}
+
+message Inventory
+{
+    Resources total = 1;
+    Resources allocatable = 2;
+    repeated InventoryEntry instances = 3;
+}
+
+message Hello
+{
+    string node_id = 1;
+    string agent_version = 2;
+    Capabilities capabilities = 3;
+    Inventory inventory = 4;
+}
+
+message Load
+{
+    uint32 running_instances = 1;
+    Resources committed = 2;
+    double cpu_load_1m = 3;
+    double thin_pool_used_percent = 4;
+    bool draining = 5;
+}
+
+message Heartbeat
+{
+    Resources allocatable = 1;
+    Load load = 2;
+    uint64 sent_at_unix_ms = 3;
+}
+
+message InstanceStatus
+{
+    string id = 1;
+    uint64 observed_generation = 2;
+    Phase phase = 3;
+    string reason = 4;
+    uint64 lease_epoch = 5;
+    string guest_ip = 6;
+}
+
+message UsageRecord
+{
+    string id = 1;
+    string instance_id = 2;
+    int64 bucket_start_unix = 3;
+    uint32 bucket_seconds = 4;
+    uint64 cpu_usec = 5;
+    uint64 memory_mib_max = 6;
+    uint64 memory_mib_avg = 7;
+    uint64 disk_read_bytes = 8;
+    uint64 disk_write_bytes = 9;
+    uint64 net_rx_bytes = 10;
+    uint64 net_tx_bytes = 11;
+}
+
+message UsageBatch
+{
+    repeated UsageRecord records = 1;
+}
+
+enum OperationStatus
+{
+    OPERATION_STATUS_UNSPECIFIED = 0;
+    OPERATION_STATUS_SUCCEEDED = 1;
+    OPERATION_STATUS_FAILED = 2;
+}
+
+message OperationResult
+{
+    string op_id = 1;
+    OperationStatus status = 2;
+    string message = 3;
+    bytes payload = 4;
+}
+
+message LeaseRenewal
+{
+    repeated LeaseHeld leases = 1;
+}
+
+message LeaseHeld
+{
+    string instance_id = 1;
+    uint64 epoch = 2;
+    uint64 remaining_ms = 3;
+}
+
+message ArtifactRef
+{
+    string digest = 1;
+    string key = 2;
+    string signature_key = 3;
+    uint64 size_bytes = 4;
+}
+
+message SnapshotRef
+{
+    string manifest_key = 1;
+}
+
+message DiskSpec
+{
+    string name = 1;
+    uint64 size_gib = 2;
+    SnapshotRef restore_from = 3;
+}
+
+message InstanceNetwork
+{
+    string world_id = 1;
+    uint32 egress_mbit = 2;
+    repeated uint32 ports = 3;
+}
+
+message Lease
+{
+    uint64 epoch = 1;
+    uint64 ttl_ms = 2;
+}
+
+message InstanceSpec
+{
+    string id = 1;
+    uint64 generation = 2;
+    Isolation isolation = 3;
+    ArtifactRef image = 4;
+    ArtifactRef kernel = 5;
+    uint32 vcpus = 6;
+    uint64 memory_mib = 7;
+    repeated DiskSpec disks = 8;
+    InstanceNetwork network = 9;
+    map<string, string> env = 10;
+    RestartPolicy restart_policy = 11;
+    Lease lease = 12;
+    RunState run_state = 13;
+    map<string, bytes> secrets = 14;
+    uint32 stop_deadline_seconds = 15;
+    bool cpu_pinning = 16;
+    bool balloon_idle_reclaim = 17;
+    uint32 idle_reclaim_minutes = 18;
+}
+
+message PutInstance
+{
+    InstanceSpec spec = 1;
+}
+
+message DeleteInstance
+{
+    string id = 1;
+}
+
+message DesiredState
+{
+    repeated InstanceSpec instances = 1;
+    NetworkConfig network = 2;
+}
+
+message SnapshotNow
+{
+    string destination_prefix = 1;
+}
+
+message StreamLogs
+{
+    uint64 tail_bytes = 1;
+    bool follow = 2;
+}
+
+message SendConsoleCommand
+{
+    string command = 1;
+}
+
+message Drain
+{
+    bool enabled = 1;
+}
+
+message CollectDiagnostics
+{
+}
+
+message RunOperation
+{
+    string op_id = 1;
+    string instance_id = 2;
+    oneof kind
+    {
+        SnapshotNow snapshot = 10;
+        StreamLogs logs = 11;
+        SendConsoleCommand console = 12;
+        Drain drain = 13;
+        CollectDiagnostics diagnostics = 14;
+    }
+}
+
+message WireGuardPeer
+{
+    string public_key = 1;
+    string endpoint = 2;
+    repeated string allowed_ips = 3;
+}
+
+message NetworkConfig
+{
+    string subnet = 1;
+    string region = 2;
+    uint32 wireguard_listen_port = 3;
+    string wireguard_address = 4;
+    repeated WireGuardPeer peers = 5;
+}
+
+message LeaseGrant
+{
+    string instance_id = 1;
+    uint64 epoch = 2;
+    uint64 ttl_ms = 3;
+}
+
+message AgentUpdate
+{
+    string version = 1;
+    string digest = 2;
+    string key = 3;
+    string signature_key = 4;
+}
+
+message LogChunk
+{
+    string op_id = 1;
+    string instance_id = 2;
+    bytes data = 3;
+    bool eof = 4;
+}
+
+message LogStreamSummary
+{
+    uint64 bytes_received = 1;
+}
+
+message EnrollRequest
+{
+    string node_id = 1;
+    string join_token = 2;
+    string csr_pem = 3;
+}
+
+message EnrollResponse
+{
+    string certificate_pem = 1;
+    string ca_pem = 2;
+    uint64 expires_at_unix = 3;
+}
