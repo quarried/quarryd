@@ -17,6 +17,7 @@ use crate::snapshot;
 pub const DATA_DEVICE: &str = "/dev/vdb";
 const REAP_SWEEP: Duration = Duration::from_secs(5);
 const FINAL_REAP_LIMIT: Duration = Duration::from_secs(2);
+const STOP_MODES: [RebootMode; 2] = [RebootMode::RB_AUTOBOOT, RebootMode::RB_POWER_OFF];
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct MountPoint
@@ -173,17 +174,17 @@ fn reap_orphans(server_pid: u32)
     }
 }
 
-pub fn power_off_on_panic()
+pub fn stop_vm_on_panic()
 {
     std::panic::set_hook(Box::new(|info| {
         log!("panic: {info}");
-        power_off();
+        stop_vm();
     }));
 }
 
-pub fn power_off() -> !
+pub fn stop_vm() -> !
 {
-    log!("powering off");
+    log!("stopping the VM");
     sync();
     let _ = kill(Pid::from_raw(-1), Signal::SIGKILL);
     let limit = Instant::now() + FINAL_REAP_LIMIT;
@@ -209,8 +210,11 @@ pub fn power_off() -> !
         Err(errno) => log!("cannot unmount {DATA_DIR}: {errno}"),
     }
     sync();
-    let Err(errno) = reboot(RebootMode::RB_POWER_OFF);
-    log!("power off failed: {errno}");
+    for mode in STOP_MODES
+    {
+        let Err(errno) = reboot(mode);
+        log!("reboot({mode:?}) failed: {errno}");
+    }
     loop
     {
         std::thread::sleep(Duration::from_secs(3600));
@@ -247,6 +251,15 @@ mod tests
             mounts
                 .iter()
                 .all(|point| point.flags.contains(MsFlags::MS_NOSUID))
+        );
+    }
+
+    #[test]
+    fn the_vm_is_stopped_by_rebooting_before_powering_off()
+    {
+        assert_eq!(
+            STOP_MODES,
+            [RebootMode::RB_AUTOBOOT, RebootMode::RB_POWER_OFF]
         );
     }
 

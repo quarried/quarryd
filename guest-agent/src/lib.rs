@@ -51,7 +51,7 @@ pub async fn run() -> i32
     #[cfg(target_os = "linux")]
     if vm_init
     {
-        init::power_off_on_panic();
+        init::stop_vm_on_panic();
         if let Err(message) = init::mount_vm_filesystems(
             std::path::Path::new("/"),
             std::path::Path::new(init::DATA_DEVICE),
@@ -73,15 +73,15 @@ pub async fn run() -> i32
     finish(code, vm_init)
 }
 
-fn finish(code: i32, power_off: bool) -> i32
+fn finish(code: i32, stop_vm: bool) -> i32
 {
     #[cfg(target_os = "linux")]
-    if power_off
+    if stop_vm
     {
-        init::power_off();
+        init::stop_vm();
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = power_off;
+    let _ = stop_vm;
     code
 }
 
