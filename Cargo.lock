@@ -1914,13 +1914,26 @@ dependencies = [
 [[package]]
 name = "quarryctl"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "prost",
+ "proto",
+ "sandbox",
+ "serde_json",
+ "store",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "quarryd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "guest-agent",
+ "guest-proto",
  "hyper-util",
+ "minisign",
  "network",
  "object_store",
  "proto",
@@ -1930,6 +1943,7 @@ dependencies = [
  "sandbox",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "store",
  "stub-control-plane",
  "tempfile",
@@ -2070,6 +2084,25 @@ dependencies = [
 [[package]]
 name = "reconciler"
 version = "0.1.0"
+dependencies = [
+ "guest-proto",
+ "minisign",
+ "network",
+ "object_store",
+ "prost",
+ "proto",
+ "sandbox",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "store",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "usage",
+ "volume",
+]
 
 [[package]]
 name = "redox_syscall"

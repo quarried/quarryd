@@ -1,0 +1,815 @@
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use guest_proto::{
+    Configure, GuestBody, GuestMessage, Health, HostBody, HostMessage, Log, MAX_ERROR_BYTES,
+    MAX_HEAP_BYTES, RateLimiter, Ready, ShutdownComplete, SnapshotPrepared,
+};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+use crate::channel::{self, Connection, Halves};
+use crate::probe::{Prober, Step};
+use crate::server::{self, DATA_DIR, Server};
+use crate::snapshot::{self, FreezeOutcome};
+use crate::{EXIT_FAILURE, EXIT_OK, Settings, output, secrets};
+
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+const SAVE_TIMEOUT: Duration = Duration::from_secs(30);
+const FREEZE_LIMIT: Duration = Duration::from_secs(60);
+const TERMINATE_DEADLINE: Duration = Duration::from_secs(30);
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+const LOG_BURST: u32 = 100;
+const LOG_LINES_PER_SECOND: f64 = 50.0;
+const EVENT_QUEUE: usize = 1024;
+
+pub enum Event
+{
+    Connected(Halves),
+    Host(u64, HostMessage),
+    Disconnected(u64),
+    ServerLine(String),
+    ServerExited(i32),
+    Frozen(Result<FreezeOutcome, String>),
+    Thawed(Result<(), String>),
+    Terminate,
+}
+
+enum SnapshotState
+{
+    Idle,
+    Saving
+    {
+        deadline: Instant,
+    },
+    Freezing,
+    Prepared
+    {
+        frozen: bool,
+        release_at: Instant,
+    },
+    Thawing,
+}
+
+impl SnapshotState
+{
+    fn deadline(&self) -> Option<Instant>
+    {
+        match self
+        {
+            SnapshotState::Saving { deadline } => Some(*deadline),
+            SnapshotState::Prepared { release_at, .. } => Some(*release_at),
+            _ => None,
+        }
+    }
+}
+
+struct Stopping
+{
+    deadline: Instant,
+    stop_sent: bool,
+    kill_sent: bool,
+}
+
+struct Agent
+{
+    settings: Settings,
+    events: mpsc::Sender<Event>,
+    connection: Option<Connection>,
+    connections_opened: u64,
+    server: Option<Server>,
+    server_pid: Arc<AtomicU32>,
+    configured: Option<(String, u64)>,
+    server_version: String,
+    ready: bool,
+    next_health: Option<Instant>,
+    prober: Prober,
+    log_limiter: RateLimiter,
+    dropped_lines: u64,
+    snapshot: SnapshotState,
+    resume_after_freeze: bool,
+    frozen: bool,
+    stopping: Option<Stopping>,
+}
+
+pub async fn run(settings: Settings) -> i32
+{
+    let (events, mut incoming) = mpsc::channel(EVENT_QUEUE);
+    let mut terminate = match signal(SignalKind::terminate())
+    {
+        Ok(terminate) => terminate,
+        Err(error) =>
+        {
+            log!("cannot listen for SIGTERM: {error}");
+            return EXIT_FAILURE;
+        }
+    };
+    let terminate_events = events.clone();
+    tokio::spawn(async move {
+        while terminate.recv().await.is_some()
+        {
+            if terminate_events.send(Event::Terminate).await.is_err()
+            {
+                return;
+            }
+        }
+    });
+    let server_pid = Arc::new(AtomicU32::new(0));
+    #[cfg(target_os = "linux")]
+    if std::process::id() == 1
+        && let Err(error) = crate::init::spawn_reaper(server_pid.clone())
+    {
+        log!("cannot reap orphaned processes: {error}");
+    }
+    channel::spawn_connector(settings.transport.clone(), events.clone());
+    let mut agent = Agent {
+        settings,
+        events,
+        connection: None,
+        connections_opened: 0,
+        server: None,
+        server_pid,
+        configured: None,
+        server_version: String::new(),
+        ready: false,
+        next_health: None,
+        prober: Prober::new(),
+        log_limiter: RateLimiter::new(LOG_BURST, LOG_LINES_PER_SECOND),
+        dropped_lines: 0,
+        snapshot: SnapshotState::Idle,
+        resume_after_freeze: false,
+        frozen: false,
+        stopping: None,
+    };
+    loop
+    {
+        let deadline = agent.next_deadline();
+        let outcome = tokio::select! {
+            event = incoming.recv() => match event
+            {
+                Some(event) => agent.handle(event).await,
+                None => Some(EXIT_FAILURE),
+            },
+            () = sleep_until(deadline) =>
+            {
+                agent.on_timers();
+                None
+            }
+        };
+        if let Some(code) = outcome
+        {
+            agent.flush().await;
+            return code;
+        }
+    }
+}
+
+async fn sleep_until(deadline: Option<Instant>)
+{
+    match deadline
+    {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Agent
+{
+    fn next_deadline(&self) -> Option<Instant>
+    {
+        let stop = self
+            .stopping
+            .as_ref()
+            .filter(|stopping| !stopping.kill_sent)
+            .map(|stopping| stopping.deadline);
+        let probe = self.prober.deadline().map(Instant::from_std);
+        [stop, probe, self.snapshot.deadline(), self.next_health]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    async fn handle(&mut self, event: Event) -> Option<i32>
+    {
+        match event
+        {
+            Event::Connected(halves) =>
+            {
+                self.on_connected(halves);
+                None
+            }
+            Event::Host(id, message) =>
+            {
+                if self.is_current(id)
+                {
+                    self.on_host_message(message)
+                }
+                else
+                {
+                    None
+                }
+            }
+            Event::Disconnected(id) =>
+            {
+                if self.is_current(id)
+                {
+                    self.connection = None;
+                    log!("lost the host connection; reconnecting");
+                    channel::spawn_connector(self.settings.transport.clone(), self.events.clone());
+                }
+                None
+            }
+            Event::ServerLine(line) =>
+            {
+                self.on_server_line(line);
+                None
+            }
+            Event::ServerExited(code) => Some(self.on_server_exited(code).await),
+            Event::Frozen(result) =>
+            {
+                self.on_frozen(result);
+                None
+            }
+            Event::Thawed(result) =>
+            {
+                self.on_thawed(result);
+                None
+            }
+            Event::Terminate =>
+            {
+                log!("received SIGTERM");
+                self.begin_shutdown(TERMINATE_DEADLINE)
+            }
+        }
+    }
+
+    fn is_current(&self, id: u64) -> bool
+    {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.id() == id)
+    }
+
+    fn send(&self, body: GuestBody) -> bool
+    {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.send(GuestMessage { body: Some(body) }))
+    }
+
+    fn command(&self, line: &str)
+    {
+        if let Some(server) = &self.server
+        {
+            server.command(line);
+        }
+    }
+
+    fn on_connected(&mut self, halves: Halves)
+    {
+        self.connections_opened += 1;
+        log!("connected to the host at {}", self.settings.transport);
+        self.connection = Some(Connection::start(
+            self.connections_opened,
+            halves,
+            self.events.clone(),
+        ));
+        if self.ready
+        {
+            self.send_ready();
+        }
+    }
+
+    fn send_ready(&self)
+    {
+        self.send(GuestBody::Ready(Ready {
+            server_version: self.server_version.clone(),
+        }));
+    }
+
+    fn on_host_message(&mut self, message: HostMessage) -> Option<i32>
+    {
+        match message.body?
+        {
+            HostBody::Configure(configure) => self.on_configure(configure),
+            HostBody::ConsoleCommand(console) =>
+            {
+                if self.server.is_some()
+                {
+                    self.command(&console.command);
+                }
+                else
+                {
+                    log!("dropping a console command: the server is not running");
+                }
+                None
+            }
+            HostBody::PrepareSnapshot(_) =>
+            {
+                self.on_prepare_snapshot();
+                None
+            }
+            HostBody::ResumeWrites(_) =>
+            {
+                self.on_resume_writes();
+                None
+            }
+            HostBody::Shutdown(shutdown) =>
+            {
+                log!(
+                    "shutdown requested with a {} ms deadline",
+                    shutdown.deadline_ms
+                );
+                self.begin_shutdown(Duration::from_millis(shutdown.deadline_ms))
+            }
+        }
+    }
+
+    fn on_configure(&mut self, configure: Configure) -> Option<i32>
+    {
+        if let Some((instance_id, generation)) = &self.configured
+        {
+            if *instance_id == configure.instance_id && *generation == configure.generation
+            {
+                log!(
+                    "Configure repeated for {instance_id} generation {generation}; the server keeps running"
+                );
+                if self.ready
+                {
+                    self.send_ready();
+                }
+            }
+            else
+            {
+                log!(
+                    "ignoring Configure for {} generation {}: already running {instance_id} generation {generation}",
+                    configure.instance_id,
+                    configure.generation
+                );
+            }
+            return None;
+        }
+        if self.stopping.is_some()
+        {
+            log!("ignoring Configure during shutdown");
+            return None;
+        }
+        let dir = match secrets::prepare_dir(
+            self.settings.secrets_override.as_deref(),
+            self.settings.vm_init,
+        )
+        {
+            Ok(dir) => dir,
+            Err(error) =>
+            {
+                log!("cannot prepare the secrets directory: {error}");
+                return Some(EXIT_FAILURE);
+            }
+        };
+        log!(
+            "secrets directory is {} ({})",
+            dir.path.display(),
+            dir.reason
+        );
+        if let Err(error) = secrets::write(&dir.path, &configure.secrets)
+        {
+            log!("cannot write secrets: {error}");
+            return Some(EXIT_FAILURE);
+        }
+        match server::spawn(
+            &configure.server_command,
+            &configure.env,
+            &dir.path,
+            self.events.clone(),
+        )
+        {
+            Ok(server) =>
+            {
+                log!(
+                    "started the server (pid {}) for {} generation {}",
+                    server.pid(),
+                    configure.instance_id,
+                    configure.generation
+                );
+                self.server_pid.store(server.pid(), Ordering::Relaxed);
+                self.server = Some(server);
+                self.configured = Some((configure.instance_id, configure.generation));
+                None
+            }
+            Err(error) =>
+            {
+                log!(
+                    "cannot start the server {:?}: {error}",
+                    configure.server_command.first()
+                );
+                Some(EXIT_FAILURE)
+            }
+        }
+    }
+
+    fn on_server_line(&mut self, line: String)
+    {
+        let now = Instant::now();
+        let (consumed, step) = self.prober.observe(&line, now.into_std());
+        self.apply_probe_step(step);
+        if consumed
+        {
+            return;
+        }
+        if !self.ready
+        {
+            if let Some(version) = output::server_version(&line)
+            {
+                self.server_version = version;
+            }
+            if line.contains(&self.settings.ready_pattern)
+            {
+                self.ready = true;
+                log!("the server is ready (version {:?})", self.server_version);
+                self.send_ready();
+                self.next_health = Some(now);
+            }
+        }
+        if matches!(self.snapshot, SnapshotState::Saving { .. }) && output::is_save_complete(&line)
+        {
+            self.start_freeze();
+        }
+        self.forward_log(line, now);
+    }
+
+    fn forward_log(&mut self, line: String, now: Instant)
+    {
+        self.flush_drop_notice(now);
+        if self.dropped_lines == 0 && self.log_limiter.allow(now.into_std())
+        {
+            self.send(GuestBody::Log(Log { line }));
+        }
+        else
+        {
+            self.dropped_lines += 1;
+        }
+    }
+
+    fn flush_drop_notice(&mut self, now: Instant)
+    {
+        if self.dropped_lines > 0 && self.log_limiter.allow(now.into_std())
+        {
+            self.send(GuestBody::Log(Log {
+                line: format!(
+                    "quarry-guest-agent: dropped {} lines of server output (rate limit)",
+                    self.dropped_lines
+                ),
+            }));
+            self.dropped_lines = 0;
+        }
+    }
+
+    fn apply_probe_step(&mut self, step: Step)
+    {
+        match step
+        {
+            Step::Wait =>
+            {}
+            Step::Send(command) => self.command(command),
+            Step::Complete => self.send_health(),
+        }
+    }
+
+    fn send_health(&self)
+    {
+        let sample = self.prober.sample();
+        let heap_used_bytes = self
+            .server
+            .as_ref()
+            .map_or(0, |server| server::resident_bytes(server.pid()))
+            .min(MAX_HEAP_BYTES);
+        self.send(GuestBody::Health(Health {
+            tps: sample.tps,
+            mspt: sample.mspt,
+            players: sample.players,
+            heap_used_bytes,
+        }));
+    }
+
+    fn on_timers(&mut self)
+    {
+        let now = Instant::now();
+        if let Some(stopping) = &mut self.stopping
+            && !stopping.kill_sent
+            && now >= stopping.deadline
+        {
+            stopping.kill_sent = true;
+            if let Some(server) = &mut self.server
+            {
+                log!("the server did not exit before the deadline; killing it");
+                server.kill();
+            }
+        }
+        let step = self.prober.expire(now.into_std());
+        self.apply_probe_step(step);
+        match self.snapshot
+        {
+            SnapshotState::Saving { deadline } if now >= deadline =>
+            {
+                log!("the world save did not finish within {SAVE_TIMEOUT:?}");
+                self.command("save-on");
+                self.snapshot = SnapshotState::Idle;
+                self.reply_prepared(
+                    false,
+                    "timed out after 30 s waiting for the world save to finish",
+                );
+                self.send_stop_when_idle();
+            }
+            SnapshotState::Prepared { release_at, .. } if now >= release_at =>
+            {
+                log!("no ResumeWrites within {FREEZE_LIMIT:?}; resuming writes");
+                self.release_writes();
+            }
+            _ =>
+            {}
+        }
+        if let Some(next_health) = self.next_health
+            && now >= next_health
+        {
+            self.next_health = Some(now + HEALTH_INTERVAL);
+            self.flush_drop_notice(now);
+            if self.server.is_some() && self.stopping.is_none()
+            {
+                let step = self.prober.begin(now.into_std());
+                self.apply_probe_step(step);
+            }
+        }
+    }
+
+    fn reply_prepared(&self, ok: bool, error: &str)
+    {
+        self.send(GuestBody::SnapshotPrepared(SnapshotPrepared {
+            ok,
+            error: output::single_line(error, MAX_ERROR_BYTES),
+        }));
+    }
+
+    fn on_prepare_snapshot(&mut self)
+    {
+        let refusal = if self.stopping.is_some()
+        {
+            Some("the server is shutting down")
+        }
+        else if self.server.is_none()
+        {
+            Some("the server is not running")
+        }
+        else if !self.ready
+        {
+            Some("the server is not ready")
+        }
+        else
+        {
+            None
+        };
+        if let Some(refusal) = refusal
+        {
+            self.reply_prepared(false, refusal);
+            return;
+        }
+        match self.snapshot
+        {
+            SnapshotState::Idle =>
+            {
+                log!("preparing a snapshot: flushing the world");
+                self.command("save-off");
+                self.command("save-all flush");
+                self.snapshot = SnapshotState::Saving {
+                    deadline: Instant::now() + SAVE_TIMEOUT,
+                };
+            }
+            SnapshotState::Saving { .. } | SnapshotState::Freezing =>
+            {
+                log!("snapshot preparation is already in progress");
+            }
+            SnapshotState::Prepared { .. } => self.reply_prepared(true, ""),
+            SnapshotState::Thawing => self.reply_prepared(false, "writes are being resumed"),
+        }
+    }
+
+    fn start_freeze(&mut self)
+    {
+        self.snapshot = SnapshotState::Freezing;
+        self.resume_after_freeze = false;
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result =
+                tokio::task::spawn_blocking(|| snapshot::sync_and_freeze(Path::new(DATA_DIR)))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = events.send(Event::Frozen(result)).await;
+        });
+    }
+
+    fn on_frozen(&mut self, result: Result<FreezeOutcome, String>)
+    {
+        let release_at = Instant::now() + FREEZE_LIMIT;
+        let prepared = match result
+        {
+            Ok(FreezeOutcome::Frozen) =>
+            {
+                log!("froze {DATA_DIR}");
+                self.frozen = true;
+                self.snapshot = SnapshotState::Prepared {
+                    frozen: true,
+                    release_at,
+                };
+                Ok(())
+            }
+            Ok(FreezeOutcome::Skipped(reason)) =>
+            {
+                log!("not freezing {DATA_DIR}: {reason}; save-off keeps the world unchanged");
+                self.snapshot = SnapshotState::Prepared {
+                    frozen: false,
+                    release_at,
+                };
+                Ok(())
+            }
+            Err(error) =>
+            {
+                log!("snapshot preparation failed: {error}");
+                self.command("save-on");
+                self.snapshot = SnapshotState::Idle;
+                Err(error)
+            }
+        };
+        match prepared
+        {
+            Ok(()) if self.stopping.is_some() =>
+            {
+                self.reply_prepared(false, "the server is shutting down")
+            }
+            Ok(()) => self.reply_prepared(true, ""),
+            Err(error) => self.reply_prepared(false, &error),
+        }
+        if self.stopping.is_some() || self.resume_after_freeze
+        {
+            self.release_writes();
+        }
+        self.send_stop_when_idle();
+    }
+
+    fn on_resume_writes(&mut self)
+    {
+        match self.snapshot
+        {
+            SnapshotState::Prepared { .. } => self.release_writes(),
+            SnapshotState::Saving { .. } =>
+            {
+                log!("ResumeWrites arrived before the snapshot was prepared; resuming");
+                self.command("save-on");
+                self.snapshot = SnapshotState::Idle;
+            }
+            SnapshotState::Freezing => self.resume_after_freeze = true,
+            SnapshotState::Idle | SnapshotState::Thawing =>
+            {}
+        }
+    }
+
+    fn release_writes(&mut self)
+    {
+        match self.snapshot
+        {
+            SnapshotState::Prepared { frozen: true, .. } =>
+            {
+                self.snapshot = SnapshotState::Thawing;
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let result =
+                        tokio::task::spawn_blocking(|| snapshot::thaw(Path::new(DATA_DIR)))
+                            .await
+                            .unwrap_or_else(|error| Err(error.to_string()));
+                    let _ = events.send(Event::Thawed(result)).await;
+                });
+            }
+            SnapshotState::Prepared { frozen: false, .. } =>
+            {
+                self.command("save-on");
+                self.snapshot = SnapshotState::Idle;
+                self.send_stop_when_idle();
+            }
+            _ =>
+            {}
+        }
+    }
+
+    fn on_thawed(&mut self, result: Result<(), String>)
+    {
+        match result
+        {
+            Ok(()) =>
+            {
+                log!("thawed {DATA_DIR}");
+                self.frozen = false;
+            }
+            Err(error) => log!("{error}"),
+        }
+        self.command("save-on");
+        self.snapshot = SnapshotState::Idle;
+        self.send_stop_when_idle();
+    }
+
+    fn begin_shutdown(&mut self, limit: Duration) -> Option<i32>
+    {
+        if self.server.is_none()
+        {
+            self.send(GuestBody::ShutdownComplete(ShutdownComplete {
+                exit_code: 0,
+            }));
+            return Some(EXIT_OK);
+        }
+        let deadline = Instant::now() + limit;
+        match &mut self.stopping
+        {
+            Some(stopping) => stopping.deadline = stopping.deadline.min(deadline),
+            None =>
+            {
+                self.stopping = Some(Stopping {
+                    deadline,
+                    stop_sent: false,
+                    kill_sent: false,
+                });
+                self.next_health = None;
+            }
+        }
+        match self.snapshot
+        {
+            SnapshotState::Saving { .. } =>
+            {
+                self.command("save-on");
+                self.snapshot = SnapshotState::Idle;
+                self.reply_prepared(false, "the server is shutting down");
+            }
+            SnapshotState::Prepared { .. } => self.release_writes(),
+            SnapshotState::Idle | SnapshotState::Freezing | SnapshotState::Thawing =>
+            {}
+        }
+        self.send_stop_when_idle();
+        None
+    }
+
+    fn send_stop_when_idle(&mut self)
+    {
+        if !matches!(self.snapshot, SnapshotState::Idle)
+        {
+            return;
+        }
+        if let Some(stopping) = &mut self.stopping
+            && !stopping.stop_sent
+        {
+            stopping.stop_sent = true;
+            if let Some(server) = &self.server
+            {
+                server.command("stop");
+            }
+        }
+    }
+
+    async fn on_server_exited(&mut self, code: i32) -> i32
+    {
+        self.server = None;
+        self.server_pid.store(0, Ordering::Relaxed);
+        if self.frozen
+        {
+            match tokio::task::spawn_blocking(|| snapshot::thaw(Path::new(DATA_DIR))).await
+            {
+                Ok(Ok(())) => self.frozen = false,
+                Ok(Err(error)) => log!("{error}"),
+                Err(error) => log!("thaw task failed: {error}"),
+            }
+        }
+        if self.stopping.is_some()
+        {
+            log!("the server exited with code {code}");
+            self.send(GuestBody::ShutdownComplete(ShutdownComplete {
+                exit_code: code,
+            }));
+            return EXIT_OK;
+        }
+        log!("the server exited unexpectedly with code {code}");
+        self.send(GuestBody::Log(Log {
+            line: format!("quarry-guest-agent: the server exited unexpectedly with code {code}"),
+        }));
+        match code
+        {
+            1..=255 => code,
+            _ => EXIT_FAILURE,
+        }
+    }
+
+    async fn flush(&mut self)
+    {
+        if let Some(connection) = self.connection.take()
+        {
+            connection.finish(FLUSH_TIMEOUT).await;
+        }
+    }
+}

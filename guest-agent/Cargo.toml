@@ -5,4 +5,22 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+name = "guest_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quarry-guest-agent"
+path = "src/main.rs"
+
 [dependencies]
+guest-proto = { workspace = true }
+nix = { workspace = true, features = ["reboot"] }
+prost = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
