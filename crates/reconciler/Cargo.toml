@@ -6,3 +6,22 @@ license.workspace = true
 publish = false
 
 [dependencies]
+guest-proto = { workspace = true }
+network = { workspace = true }
+prost = { workspace = true }
+proto = { workspace = true }
+sandbox = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+store = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+usage = { workspace = true }
+volume = { workspace = true }
+
+[dev-dependencies]
+minisign = "0.10"
+object_store = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
