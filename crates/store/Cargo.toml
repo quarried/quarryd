@@ -6,3 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
