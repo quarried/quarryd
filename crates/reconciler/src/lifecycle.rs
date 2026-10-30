@@ -34,6 +34,13 @@ impl Lifecycle
         (Phase::Rejected, Phase::Deleting),
         (Phase::Pending, Phase::Deleting),
         (Phase::Deleted, Phase::Pending),
+        // A recovered sandbox may need a controlled runtime-layout migration
+        // before it can reconnect, even while its guest is still starting.
+        (Phase::Booting, Phase::Stopping),
+        (Phase::Starting, Phase::Stopping),
+        // A cancelled boot with no live sandbox can settle without launching.
+        (Phase::Preparing, Phase::Stopped),
+        (Phase::Booting, Phase::Stopped),
     ];
 
     pub fn allows(from: Phase, to: Phase) -> bool
@@ -133,8 +140,6 @@ mod tests
             (Phase::Deleting, Phase::Stopped),
             (Phase::Deleted, Phase::Running),
             (Phase::Rejected, Phase::Running),
-            (Phase::Booting, Phase::Stopping),
-            (Phase::Starting, Phase::Stopping),
         ];
         for (from, to) in refused
         {

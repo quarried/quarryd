@@ -46,6 +46,7 @@ flowchart LR
 - KVM sources: bare-metal or dedicated servers, or cloud VM types with nested virtualization (AWS C7i/M7i/R7i, 8th-gen Intel families, GCP, Azure).
 - Local NVMe for instance volumes.
 - systemd as PID 1.
+- Dedicated public IPv4 networking requires `conntrack` from conntrack-tools on the host's `PATH` (`apt install conntrack` on Debian/Ubuntu), in addition to `nft` and `tc`. Public address changes remain blocked if connection cleanup cannot run.
 - x86_64 first; aarch64 is supported by the VMM but is a second build target.
 
 ---

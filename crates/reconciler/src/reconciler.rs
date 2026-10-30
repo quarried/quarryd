@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::admission::{Admission, Decision, Verdict, allocatable, spec_resources};
-use crate::leases::{GrantOutcome, Leases, unix_ms_now};
+use crate::leases::{Leases, unix_ms_now};
 use crate::lifecycle::Lifecycle;
 use crate::sampler::Sampler;
 use crate::supervisor::{Command, Desired, Supervisor};
@@ -118,24 +118,6 @@ impl Inner
         self.shut_down.load(Ordering::SeqCst)
     }
 
-    pub fn persist_lease(&self, instance_id: &str) -> Result<(), ReconcilerError>
-    {
-        let _guard = lock(&self.write_lock);
-        let Some(row) = self.parts.store.get_instance(instance_id)?
-        else
-        {
-            return Ok(());
-        };
-        let lease = lock(&self.leases).get(instance_id);
-        let mut actual = row.actual();
-        actual.lease_epoch = lease.map(|lease| lease.epoch).unwrap_or(actual.lease_epoch);
-        actual.lease_expires_unix_ms = lease
-            .map(|lease| lease.expires_unix_ms)
-            .or(actual.lease_expires_unix_ms);
-        self.parts.store.update_actual(instance_id, &actual)?;
-        Ok(())
-    }
-
     pub fn poke(&self, instance_id: &str)
     {
         if let Some(link) = lock(&self.supervisors).get(instance_id)
@@ -148,6 +130,18 @@ impl Inner
 pub(crate) fn decode_spec(bytes: &[u8]) -> Result<InstanceSpec, ReconcilerError>
 {
     Ok(InstanceSpec::decode(bytes)?)
+}
+
+/// Compare desired state by its contents, independent of protobuf map ordering.
+/// Secret values remain memory-only and are refilled even when a put is a replay.
+pub(crate) fn normalized_spec(spec: &InstanceSpec) -> InstanceSpec
+{
+    let mut normalized = spec.clone();
+    for value in normalized.secrets.values_mut()
+    {
+        value.clear();
+    }
+    normalized
 }
 
 fn node_network(config: &NetworkConfig) -> Result<NodeNetwork, ReconcilerError>
@@ -211,16 +205,57 @@ fn seed_decision(row: &InstanceRow, spec: &InstanceSpec) -> Option<Decision>
     }
     match Lifecycle::parse_phase(&row.phase)
     {
-        Phase::Rejected if row.observed_generation == row.generation => Some(Decision {
-            generation: row.generation,
-            verdict: Verdict::Rejected(row.reason.clone()),
-        }),
+        Phase::Rejected if row.observed_generation == row.generation => Some(Decision::unverified(
+            row.generation,
+            Verdict::Rejected(row.reason.clone()),
+        )),
         Phase::Pending | Phase::Rejected | Phase::Deleting | Phase::Deleted => None,
-        _ => Some(Decision {
-            generation: row.observed_generation,
-            verdict: Verdict::Admitted(spec_resources(spec)),
-        }),
+        _ => Some(
+            match row
+                .applied_spec
+                .as_deref()
+                .and_then(|bytes| decode_spec(bytes).ok())
+            {
+                Some(applied) =>
+                {
+                    Decision::new(&applied, Verdict::Admitted(spec_resources(&applied)))
+                }
+                None if row.sandbox_record.is_some()
+                    || Lifecycle::holds_sandbox(Lifecycle::parse_phase(&row.phase)) =>
+                {
+                    // Preserve an existing legacy placement until its desired contents
+                    // change. This is only an admission baseline, never an applied spec:
+                    // actual_resources still reserves the full node for unknown usage.
+                    Decision::new(spec, Verdict::Admitted(spec_resources(spec)))
+                }
+                None => Decision::unverified(
+                    row.observed_generation,
+                    Verdict::Admitted(spec_resources(spec)),
+                ),
+            },
+        ),
     }
+}
+
+fn actual_resources(rows: &[InstanceRow], allocatable: Resources) -> BTreeMap<String, Resources>
+{
+    rows.iter()
+        .filter(|row| {
+            row.sandbox_record.is_some()
+                || Lifecycle::holds_sandbox(Lifecycle::parse_phase(&row.phase))
+        })
+        .map(|row| {
+            let resources = row
+                .applied_spec
+                .as_deref()
+                .and_then(|bytes| decode_spec(bytes).ok())
+                .map(|spec| spec_resources(&spec))
+                // An older row may have lost the original running spec when a
+                // desired update was stored. Do not assume it uses the new limits.
+                .unwrap_or(allocatable);
+            (row.id.clone(), resources)
+        })
+        .collect()
 }
 
 fn strip_secrets(spec: &mut InstanceSpec) -> SecretValues
@@ -283,6 +318,7 @@ impl Reconciler
                 }
             }
             let rows = inner.parts.store.list_instances()?;
+            admission.set_actual_resources(actual_resources(&rows, inner.allocatable()));
             {
                 let now = Instant::now();
                 let now_ms = unix_ms_now();
@@ -306,11 +342,33 @@ impl Reconciler
                         continue;
                     }
                 };
-                for disk in &spec.disks
+                let mut disk_names: BTreeSet<String> = spec
+                    .disks
+                    .iter()
+                    .map(|disk| disk.name.clone())
+                    .collect();
+                if let Some(bytes) = row.applied_spec.as_deref()
                 {
-                    inner.parts.store.remember_disk(&row.id, &crate::admission::volume_name(&row.id, &disk.name))?;
+                    disk_names.extend(decode_spec(bytes)?.disks.into_iter().map(|disk| disk.name));
                 }
-                let decision = seed_decision(&row, &spec);
+                let mut ownership_rejection = None;
+                for disk in disk_names
+                {
+                    match crate::provision::resolve_disk_name(&inner, &row.id, &disk).await
+                    {
+                        Ok(_) => {}
+                        Err(error @ ReconcilerError::Store(store::StoreError::DiskOwnership { .. })) =>
+                        {
+                            tracing::error!(instance_id = %row.id, error = %error, "refusing an instance with ambiguous disk ownership");
+                            ownership_rejection = Some(error.to_string());
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let decision = ownership_rejection
+                    .map(|reason| Decision::new(&spec, Verdict::Rejected(reason)))
+                    .or_else(|| seed_decision(&row, &spec));
                 if let Some(decision) = &decision
                 {
                     admission.seed(&row.id, decision.clone());
@@ -382,10 +440,13 @@ impl Reconciler
             }
         }
         let rows = self.inner.parts.store.list_instances()?;
+        self.admission
+            .set_actual_resources(actual_resources(&rows, self.inner.allocatable()));
         let ids: BTreeSet<String> = rows.iter().map(|row| row.id.clone()).collect();
         lock(&self.inner.supervisors).retain(|_, link| !link.task.is_finished());
         self.admission.retain(|id| ids.contains(id));
         let draining = self.inner.draining.load(Ordering::SeqCst);
+        let mut public_claims = BTreeMap::<String, String>::new();
         for row in rows
         {
             let spec = match decode_spec(&row.spec)
@@ -415,19 +476,37 @@ impl Reconciler
                         is_new,
                         draining,
                         &self.inner.parts.volumes,
+                        &self.inner.parts.store,
                         &self.inner.parts.metrics,
                     )
                     .await;
                 if let Some(network) = &spec.network
                     && !network.public_ipv4.is_empty()
-                    && let Err(error) = self
+                {
+                    let rejection = self
                         .inner
                         .parts
                         .network
                         .validate_public_ipv4(&spec.id, &network.public_ipv4)
-                {
-                    decision.verdict = Verdict::Rejected(error.to_string());
-                    self.admission.seed(&spec.id, decision.clone());
+                        .err()
+                        .map(|error| error.to_string())
+                        .or_else(|| {
+                            public_claims.get(&network.public_ipv4).map(|owner| {
+                                format!(
+                                    "public IPv4 {} is already reserved by instance {owner}",
+                                    network.public_ipv4
+                                )
+                            })
+                        });
+                    if let Some(reason) = rejection
+                    {
+                        decision.verdict = Verdict::Rejected(reason);
+                        self.admission.seed(&spec.id, decision.clone());
+                    }
+                    else if matches!(decision.verdict, Verdict::Admitted(_))
+                    {
+                        public_claims.insert(network.public_ipv4.clone(), spec.id.clone());
+                    }
                 }
                 if let Verdict::Rejected(reason) = &decision.verdict
                 {
@@ -500,93 +579,75 @@ impl ReconcilerHandle
         let outcome = {
             let _disk_guard = self.inner.disk_lock.lock().await;
             let _guard = lock(&self.inner.write_lock);
-            if let Some(current) = self.inner.parts.store.get_instance(&spec.id)?
-                && current.generation > spec.generation
+            let previous = self.inner.parts.store.get_instance(&spec.id)?;
+            if previous.as_ref().is_some_and(|current| {
+                current.generation > spec.generation
+                    || (current.desired_deleted && current.generation == spec.generation)
+            })
             {
                 return Ok(());
             }
-            if let Some(network) = &spec.network
-                && !network.public_ipv4.is_empty()
+            // Protobuf maps have no wire-order guarantee. Compare decoded contents
+            // against legacy rows too, rather than treating a new encoding as a put.
+            let unchanged = match &previous
             {
-                let mut rejection = self
-                    .inner
-                    .parts
-                    .network
-                    .validate_public_ipv4(&spec.id, &network.public_ipv4)
-                    .err()
-                    .map(|error| error.to_string());
-                if rejection.is_none()
+                Some(current) if current.generation == spec.generation =>
                 {
-                    for row in self.inner.parts.store.list_instances()?
-                    {
-                        if row.id == spec.id
-                            || row.desired_deleted
-                            || Lifecycle::parse_phase(&row.phase) == Phase::Rejected
-                        {
-                            continue;
-                        }
-                        let other = decode_spec(&row.spec)?;
-                        if other
-                            .network
-                            .as_ref()
-                            .is_some_and(|other| other.public_ipv4 == network.public_ipv4)
-                        {
-                            rejection = Some(format!(
-                                "public IPv4 {} is already reserved by instance {}",
-                                network.public_ipv4, row.id
-                            ));
-                            break;
-                        }
-                    }
+                    normalized_spec(&decode_spec(&current.spec)?) == spec
                 }
-                if let Some(reason) = rejection
-                {
-                    self.inner.emit(InstanceStatus {
-                        id: spec.id.clone(),
-                        observed_generation: spec.generation,
-                        phase: Phase::Rejected as i32,
-                        reason,
-                        ..Default::default()
-                    });
-                    return Ok(());
-                }
-            }
-            if let Some(previous) = self.inner.parts.store.get_instance(&spec.id)?
-                && previous.generation < spec.generation
+                _ => false,
+            };
+            let outcome = if unchanged
             {
-                let previous_spec = decode_spec(&previous.spec)?;
-                for disk in &previous_spec.disks
-                {
-                    self.inner.parts.store.remember_disk(
-                        &spec.id,
-                        &crate::admission::volume_name(&spec.id, &disk.name),
-                    )?;
-                }
+                PutOutcome::Unchanged
             }
-            self.inner
-                .parts
-                .store
-                .put_desired(&spec.id, spec.generation, &bytes)?
+            else
+            {
+                let mut leases = lock(&self.inner.leases);
+                let held = leases.get(&spec.id);
+                let epoch_floor = previous
+                    .as_ref()
+                    .map(|row| row.lease_epoch)
+                    .unwrap_or(0)
+                    .max(held.map(|lease| lease.epoch).unwrap_or(0));
+                let now = Instant::now();
+                let now_ms = unix_ms_now();
+                let embedded = spec
+                    .lease
+                    .as_ref()
+                    .filter(|lease| lease.epoch >= epoch_floor)
+                    .map(|lease| (lease.epoch, self.lease_ttl(lease.ttl_ms)));
+                let durable_lease = embedded
+                    .map(|(epoch, ttl)| {
+                        let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+                        (epoch, now_ms.saturating_add(ttl_ms))
+                    })
+                    .or_else(|| held.map(|lease| (lease.epoch, lease.expires_unix_ms)));
+                // A crash must not leave a stored spec whose initial embedded grant
+                // was never applied: an identical replay deliberately does not renew.
+                let outcome = self.inner.parts.store.put_desired_with_lease(
+                    &spec.id,
+                    spec.generation,
+                    &bytes,
+                    durable_lease,
+                )?;
+                if matches!(outcome, PutOutcome::Inserted | PutOutcome::Updated)
+                    && let Some((epoch, ttl)) = embedded
+                {
+                    leases.grant(&spec.id, epoch, ttl, now, now_ms);
+                }
+                outcome
+            };
+            if outcome != PutOutcome::Stale
+            {
+                lock(&self.inner.secrets).insert(spec.id.clone(), (spec.generation, secrets));
+            }
+            outcome
         };
         tracing::info!(instance_id = %spec.id, generation = spec.generation, outcome = ?outcome, "put instance stored");
         if outcome == PutOutcome::Stale
         {
             return Ok(());
-        }
-        {
-            let mut known = lock(&self.inner.secrets);
-            let newer = known
-                .get(&spec.id)
-                .is_none_or(|(generation, _)| *generation <= spec.generation);
-            if newer
-            {
-                known.insert(spec.id.clone(), (spec.generation, secrets));
-            }
-        }
-        if matches!(outcome, PutOutcome::Inserted | PutOutcome::Updated)
-            && let Some(lease) = &spec.lease
-        {
-            self.apply_grant(&spec.id, lease.epoch, lease.ttl_ms)?;
         }
         self.inner.poke(&spec.id);
         self.inner.wake.notify_one();
@@ -694,22 +755,46 @@ impl ReconcilerHandle
     fn apply_grant(&self, instance_id: &str, epoch: u64, ttl_ms: u64)
     -> Result<(), ReconcilerError>
     {
-        let ttl = if ttl_ms == 0
+        let _guard = lock(&self.inner.write_lock);
+        let mut leases = lock(&self.inner.leases);
+        let row = self.inner.parts.store.get_instance(instance_id)?;
+        let epoch_floor = row
+            .as_ref()
+            .map(|row| row.lease_epoch)
+            .unwrap_or(0)
+            .max(leases.epoch(instance_id));
+        if epoch < epoch_floor
+        {
+            tracing::info!(instance_id, epoch, "lease grant with a lower epoch ignored");
+            return Ok(());
+        }
+        let ttl = self.lease_ttl(ttl_ms);
+        let now = Instant::now();
+        let now_ms = unix_ms_now();
+        if let Some(row) = row
+        {
+            let mut actual = row.actual();
+            actual.lease_epoch = epoch;
+            actual.lease_expires_unix_ms =
+                Some(now_ms.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)));
+            self.inner.parts.store.update_actual(instance_id, &actual)?;
+        }
+        // Publish authority only after its durable state is committed. Keeping the
+        // same locks as put_instance also prevents an older put racing a renewal.
+        leases.grant(instance_id, epoch, ttl, now, now_ms);
+        Ok(())
+    }
+
+    fn lease_ttl(&self, ttl_ms: u64) -> Duration
+    {
+        if ttl_ms == 0
         {
             self.inner.config.default_lease_ttl
         }
         else
         {
             Duration::from_millis(ttl_ms)
-        };
-        let outcome =
-            lock(&self.inner.leases).grant(instance_id, epoch, ttl, Instant::now(), unix_ms_now());
-        if outcome == GrantOutcome::Ignored
-        {
-            tracing::info!(instance_id = %instance_id, epoch, "lease grant with a lower epoch ignored");
-            return Ok(());
         }
-        self.inner.persist_lease(instance_id)
     }
 
     pub fn lease_renewal(&self) -> LeaseRenewal

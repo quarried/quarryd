@@ -179,6 +179,10 @@ pub(crate) async fn ensure_running(
 
 pub(crate) async fn kill_and_wait(systemd: &UnitBus, unit: &str) -> Result<(), SandboxError>
 {
+    // StartTransientUnit can return while its job is still queued and no PID is
+    // running. Replace that job before checking state or sending a signal, so a
+    // cancelled launch cannot start after cleanup has already returned.
+    systemd.stop_unit(unit).await?;
     if !is_running(systemd, unit).await?
     {
         return Ok(());
@@ -207,6 +211,8 @@ pub(crate) async fn cgroup_path(
     unit: &str,
 ) -> Result<Option<PathBuf>, SandboxError>
 {
+    // Repair units adopted after an upgrade as well as newly launched units.
+    systemd.enable_io_accounting(unit).await?;
     Ok(systemd
         .unit_control_group(unit)
         .await?

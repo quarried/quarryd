@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,17 +10,21 @@ use proto::v1::agent_gateway_client::AgentGatewayClient;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use tracing::info;
+use tracing::{info, warn};
 
 const CERT_FILE: &str = "node.crt";
 const KEY_FILE: &str = "node.key";
 const EXPIRY_FILE: &str = "node.expires";
+const IDENTITY_FILE: &str = "identity.json";
+const PREVIOUS_IDENTITY_FILE: &str = "identity.previous.json";
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct NodeIdentity
 {
     pub certificate_pem: String,
@@ -31,34 +36,116 @@ impl NodeIdentity
 {
     pub fn load(dir: &Path) -> Result<Option<NodeIdentity>>
     {
-        let cert_path = dir.join(CERT_FILE);
-        if !cert_path.exists()
+        let mut failure = None;
+        for name in [IDENTITY_FILE, PREVIOUS_IDENTITY_FILE]
         {
-            return Ok(None);
+            match Self::load_bundle(&dir.join(name))
+            {
+                Ok(Some(identity)) => return Ok(Some(identity)),
+                Ok(None) =>
+                {}
+                Err(error) =>
+                {
+                    failure.get_or_insert(error);
+                }
+            }
         }
-        let certificate_pem = std::fs::read_to_string(&cert_path)?;
+        match Self::load_legacy(dir)
+        {
+            Ok(Some(identity)) => Ok(Some(identity)),
+            Ok(None) => match failure
+            {
+                Some(error) => Err(error),
+                None => Ok(None),
+            },
+            Err(error) => Err(failure.unwrap_or(error)),
+        }
+    }
+
+    fn load_bundle(path: &Path) -> Result<Option<NodeIdentity>>
+    {
+        let bytes = match std::fs::read(path)
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        // Serde errors can include field contents. Never include bundle contents
+        // in an error, since the bundle contains the private key.
+        let identity: NodeIdentity = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow!("invalid identity bundle at {}", path.display()))?;
+        identity.validate()?;
+        Ok(Some(identity))
+    }
+
+    fn load_legacy(dir: &Path) -> Result<Option<NodeIdentity>>
+    {
+        let cert_path = dir.join(CERT_FILE);
+        let certificate_pem = match std::fs::read_to_string(&cert_path)
+        {
+            Ok(certificate) => certificate,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("reading legacy node certificate"),
+        };
         let key_pem = std::fs::read_to_string(dir.join(KEY_FILE))?;
         let expires_at_unix = std::fs::read_to_string(dir.join(EXPIRY_FILE))
             .ok()
             .and_then(|text| text.trim().parse().ok())
             .unwrap_or(0);
-        Ok(Some(NodeIdentity {
+        let identity = NodeIdentity {
             certificate_pem,
             key_pem,
             expires_at_unix,
-        }))
+        };
+        identity.validate()?;
+        Ok(Some(identity))
     }
 
     pub fn save(&self, dir: &Path) -> Result<()>
     {
+        self.validate()?;
+        let directory = std::path::absolute(dir).context("resolving node identity directory")?;
+        let dir = directory.as_path();
+        let previous = Self::load(dir)?;
         std::fs::create_dir_all(dir)?;
-        write_private(&dir.join(KEY_FILE), self.key_pem.as_bytes())?;
-        write_atomic(&dir.join(CERT_FILE), self.certificate_pem.as_bytes())?;
-        write_atomic(
-            &dir.join(EXPIRY_FILE),
-            self.expires_at_unix.to_string().as_bytes(),
-        )?;
+        // Persist directory entries too, including directories created by the
+        // caller immediately before the initial enrollment.
+        for parent in dir
+            .ancestors()
+            .skip(1)
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            sync_directory(parent)?;
+        }
+        if let Some(previous) = previous
+        {
+            // This must be durable before activation. It also migrates legacy
+            // credentials without modifying any of the legacy files.
+            write_private(
+                &dir.join(PREVIOUS_IDENTITY_FILE),
+                &serde_json::to_vec(&previous)?,
+            )?;
+        }
+        write_private(&dir.join(IDENTITY_FILE), &serde_json::to_vec(self)?)?;
         Ok(())
+    }
+
+    fn validate(&self) -> Result<()>
+    {
+        let chain = CertificateDer::pem_slice_iter(self.certificate_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .context("parsing node certificate")?;
+        let key =
+            PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes()).context("parsing node key")?;
+        let certified = rustls::sign::CertifiedKey::from_der(
+            chain,
+            key,
+            &rustls::crypto::ring::default_provider(),
+        )
+        .context("validating node certificate and key")?;
+        certified
+            .keys_match()
+            .context("matching node certificate and key")
     }
 
     pub fn needs_rotation(&self, now_unix: u64) -> bool
@@ -72,12 +159,11 @@ impl NodeIdentity
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()>
+fn sync_directory(path: &Path) -> Result<()>
 {
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, bytes)?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
+    std::fs::File::open(path)?
+        .sync_all()
+        .with_context(|| format!("syncing identity directory {}", path.display()))
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()>
@@ -85,17 +171,35 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()>
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let temporary = path.with_extension("tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
+    let parent = path
+        .parent()
+        .context("identity bundle has no parent directory")?;
+    let (temporary, mut file) = loop
+    {
+        let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".identity-{}-{sequence}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("creating staged node identity"),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err()
+    {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn now_unix() -> u64
@@ -146,7 +250,16 @@ impl Transport
         match existing
         {
             Some(identity) if !identity.needs_rotation(now_unix()) => Ok(identity),
-            Some(identity) => self.enroll(endpoint, Some(&identity), "").await,
+            Some(identity) => match self.enroll(endpoint, Some(&identity), "").await
+            {
+                Ok(rotated) => Ok(rotated),
+                Err(_) if identity.expires_at_unix > now_unix() =>
+                {
+                    warn!("node certificate rotation failed; retaining the current identity");
+                    Ok(identity)
+                }
+                Err(error) => Err(error),
+            },
             None =>
             {
                 let token = join_token
@@ -190,6 +303,10 @@ impl Transport
             key_pem: key_pair.serialize_pem(),
             expires_at_unix: response.expires_at_unix,
         };
+        if identity.expires_at_unix <= now_unix()
+        {
+            bail!("control plane returned an expired certificate");
+        }
         identity.save(&self.identity_dir)?;
         info!(
             expires_at_unix = identity.expires_at_unix,

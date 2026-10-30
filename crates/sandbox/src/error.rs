@@ -5,6 +5,14 @@ pub enum SandboxError
 {
     #[error("operation not supported by this sandbox backend")]
     Unsupported,
+    #[error("sandbox launch was cancelled")]
+    LaunchCancelled,
+    #[error("sandbox launch failed: {launch}; cleanup failed: {cleanup}")]
+    LaunchCleanup
+    {
+        launch: Box<SandboxError>,
+        cleanup: Box<SandboxError>,
+    },
     #[error("{context}: {source}")]
     Io
     {

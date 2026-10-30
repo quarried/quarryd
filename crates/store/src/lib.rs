@@ -93,6 +93,19 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (instance_id, name)
     ) WITHOUT ROWID;
     ",
+    "
+    ALTER TABLE instances ADD COLUMN applied_spec BLOB;
+    CREATE TABLE disk_bindings (
+        instance_id TEXT NOT NULL,
+        disk_name TEXT NOT NULL,
+        volume_name TEXT NOT NULL UNIQUE,
+        PRIMARY KEY (instance_id, disk_name)
+    ) WITHOUT ROWID;
+    CREATE TABLE disk_ownership_conflicts (
+        name TEXT PRIMARY KEY NOT NULL,
+        detail TEXT NOT NULL
+    ) WITHOUT ROWID;
+    ",
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -101,7 +114,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const INSTANCE_COLUMNS: &str = "id, generation, spec, desired_deleted, observed_generation, phase, reason, \
      unit_name, api_socket, pid, sandbox_record, network_attachment, guest_ip, uid, restart_count, \
-     last_exit_unix, lease_epoch, lease_expires_unix_ms, updated_at_unix";
+     last_exit_unix, lease_epoch, lease_expires_unix_ms, updated_at_unix, applied_spec";
 
 const OPERATION_COLUMNS: &str =
     "op_id, kind, instance_id, status, message, payload, started_at_unix, finished_at_unix";
@@ -130,6 +143,11 @@ pub enum StoreError
     WalUnavailable(String),
     #[error("instance {0} not found")]
     InstanceNotFound(String),
+    #[error("volume {name:?} has conflicting or unverified ownership: {detail}")]
+    DiskOwnership
+    {
+        name: String, detail: String
+    },
     #[error("operation {0} not found")]
     OperationNotFound(String),
     #[error("artifact {0} not found")]
@@ -186,6 +204,7 @@ pub struct InstanceRow
     pub lease_epoch: u64,
     pub lease_expires_unix_ms: Option<i64>,
     pub updated_at_unix: i64,
+    pub applied_spec: Option<Vec<u8>>,
 }
 
 impl InstanceRow
@@ -207,6 +226,7 @@ impl InstanceRow
             last_exit_unix: self.last_exit_unix,
             lease_epoch: self.lease_epoch,
             lease_expires_unix_ms: self.lease_expires_unix_ms,
+            applied_spec: self.applied_spec.clone(),
         }
     }
 }
@@ -228,6 +248,7 @@ pub struct ActualState
     pub last_exit_unix: Option<i64>,
     pub lease_epoch: u64,
     pub lease_expires_unix_ms: Option<i64>,
+    pub applied_spec: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -389,7 +410,21 @@ impl Store
         spec: &[u8],
     ) -> Result<PutOutcome, StoreError>
     {
+        self.put_desired_with_lease(id, generation, spec, None)
+    }
+
+    pub fn put_desired_with_lease(
+        &self,
+        id: &str,
+        generation: u64,
+        spec: &[u8],
+        lease: Option<(u64, i64)>,
+    ) -> Result<PutOutcome, StoreError>
+    {
         let generation = to_i64(generation)?;
+        let lease = lease
+            .map(|(epoch, expires)| Ok::<_, StoreError>((to_i64(epoch)?, expires)))
+            .transpose()?;
         let now = now_unix();
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
@@ -430,15 +465,130 @@ impl Store
                 PutOutcome::Updated
             }
         };
+        if matches!(outcome, PutOutcome::Inserted | PutOutcome::Updated)
+            && let Some((epoch, expires)) = lease
+        {
+            transaction.execute(
+                "UPDATE instances SET lease_epoch = ?2, lease_expires_unix_ms = ?3 \
+                 WHERE id = ?1 AND lease_epoch <= ?2",
+                params![id, epoch, expires],
+            )?;
+        }
         transaction.commit()?;
         Ok(outcome)
     }
 
     pub fn remember_disk(&self, instance_id: &str, name: &str) -> Result<(), StoreError>
     {
-        self.connection().execute(
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        check_disk_owner(&transaction, instance_id, name)?;
+        transaction.execute(
             "INSERT OR IGNORE INTO instance_disks (instance_id, name) VALUES (?1, ?2)",
             params![instance_id, name],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist a logical disk's physical name before creating or using its volume.
+    pub fn claim_disk(
+        &self,
+        instance_id: &str,
+        disk_name: &str,
+        name: &str,
+    ) -> Result<(), StoreError>
+    {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        check_disk_owner(&transaction, instance_id, name)?;
+        let conflict: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT instance_id, disk_name, volume_name FROM disk_bindings \
+             WHERE (volume_name = ?3 OR (instance_id = ?1 AND disk_name = ?2)) \
+             AND NOT (instance_id = ?1 AND disk_name = ?2 AND volume_name = ?3)",
+                params![instance_id, disk_name, name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((owner, disk, volume)) = conflict
+        {
+            return Err(StoreError::DiskOwnership {
+                name: name.to_owned(),
+                detail: format!("already bound to {owner:?}/{disk:?} at {volume:?}"),
+            });
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO disk_bindings (instance_id, disk_name, volume_name) VALUES (?1, ?2, ?3)",
+            params![instance_id, disk_name, name],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO instance_disks (instance_id, name) VALUES (?1, ?2)",
+            params![instance_id, name],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn disk_binding(
+        &self,
+        instance_id: &str,
+        disk_name: &str,
+    ) -> Result<Option<String>, StoreError>
+    {
+        let connection = self.connection();
+        let name: Option<String> = connection
+            .query_row(
+                "SELECT volume_name FROM disk_bindings WHERE instance_id = ?1 AND disk_name = ?2",
+                params![instance_id, disk_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(name) = &name
+        {
+            check_disk_owner(&connection, instance_id, name)?;
+        }
+        Ok(name)
+    }
+
+    pub fn assert_disk_owner(&self, instance_id: &str, name: &str) -> Result<(), StoreError>
+    {
+        let connection = self.connection();
+        check_disk_owner(&connection, instance_id, name)?;
+        let owned: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM instance_disks WHERE instance_id = ?1 AND name = ?2)",
+            params![instance_id, name],
+            |row| row.get(0),
+        )?;
+        if !owned
+        {
+            return Err(StoreError::DiskOwnership {
+                name: name.to_owned(),
+                detail: "no durable owner".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn bound_disk(&self, name: &str) -> Result<Option<(String, String)>, StoreError>
+    {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT instance_id, disk_name FROM disk_bindings WHERE volume_name = ?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Preserve ambiguity even if a later desired update removes the evidence.
+    /// These records require an operator to identify the correct world owner.
+    pub fn quarantine_disk(&self, name: &str, detail: &str) -> Result<(), StoreError>
+    {
+        self.connection().execute(
+            "INSERT OR IGNORE INTO disk_ownership_conflicts (name, detail) VALUES (?1, ?2)",
+            params![name, detail],
         )?;
         Ok(())
     }
@@ -455,10 +605,18 @@ impl Store
 
     pub fn forget_disk(&self, instance_id: &str, name: &str) -> Result<(), StoreError>
     {
-        self.connection().execute(
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        check_disk_owner(&transaction, instance_id, name)?;
+        transaction.execute(
             "DELETE FROM instance_disks WHERE instance_id = ?1 AND name = ?2",
             params![instance_id, name],
         )?;
+        transaction.execute(
+            "DELETE FROM disk_bindings WHERE instance_id = ?1 AND volume_name = ?2",
+            params![instance_id, name],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -497,7 +655,7 @@ impl Store
             "UPDATE instances SET observed_generation = ?2, phase = ?3, reason = ?4, unit_name = ?5, \
              api_socket = ?6, pid = ?7, sandbox_record = ?8, network_attachment = ?9, guest_ip = ?10, \
              uid = ?11, restart_count = ?12, last_exit_unix = ?13, lease_epoch = ?14, \
-             lease_expires_unix_ms = ?15, updated_at_unix = ?16 WHERE id = ?1",
+             lease_expires_unix_ms = ?15, updated_at_unix = ?16, applied_spec = ?17 WHERE id = ?1",
             params![
                 id,
                 to_i64(actual.observed_generation)?,
@@ -515,6 +673,7 @@ impl Store
                 to_i64(actual.lease_epoch)?,
                 actual.lease_expires_unix_ms,
                 now_unix(),
+                actual.applied_spec,
             ],
         )?;
         if changed == 0
@@ -1001,6 +1160,41 @@ fn query_operation(connection: &Connection, op_id: &str)
         .optional()?)
 }
 
+fn check_disk_owner(
+    connection: &Connection,
+    instance_id: &str,
+    name: &str,
+) -> Result<(), StoreError>
+{
+    let conflict: Option<String> = connection
+        .query_row(
+            "SELECT detail FROM disk_ownership_conflicts WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(detail) = conflict
+    {
+        return Err(StoreError::DiskOwnership {
+            name: name.to_owned(),
+            detail,
+        });
+    }
+    let other: Option<String> = connection.query_row(
+        "SELECT instance_id FROM instance_disks WHERE name = ?1 AND instance_id != ?2 \
+         UNION SELECT instance_id FROM disk_bindings WHERE volume_name = ?1 AND instance_id != ?2 LIMIT 1",
+        params![name, instance_id], |row| row.get(0),
+    ).optional()?;
+    if let Some(owner) = other
+    {
+        return Err(StoreError::DiskOwnership {
+            name: name.to_owned(),
+            detail: format!("also recorded for instance {owner:?}"),
+        });
+    }
+    Ok(())
+}
+
 fn instance_from_row(row: &Row<'_>) -> rusqlite::Result<InstanceRow>
 {
     Ok(InstanceRow {
@@ -1023,6 +1217,7 @@ fn instance_from_row(row: &Row<'_>) -> rusqlite::Result<InstanceRow>
         lease_epoch: column_u64(row, 16)?,
         lease_expires_unix_ms: row.get(17)?,
         updated_at_unix: row.get(18)?,
+        applied_spec: row.get(19)?,
     })
 }
 

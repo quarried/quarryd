@@ -120,7 +120,10 @@ pub fn decode_guest_message(bytes: &[u8]) -> Result<GuestMessage, GuestProtoErro
         {}
         Some(GuestBody::SnapshotPrepared(prepared)) =>
         {
-            single_line("error", &prepared.error, MAX_ERROR_BYTES)?
+            single_line("error", &prepared.error, MAX_ERROR_BYTES)?;
+            // Missing IDs from old guests decode, but cannot match a new host's
+            // nonempty request. The host fails the snapshot closed.
+            single_line("request_id", &prepared.request_id, MAX_INSTANCE_ID_BYTES)?;
         }
     }
     Ok(message)
@@ -149,8 +152,8 @@ pub fn decode_host_message(bytes: &[u8]) -> Result<HostMessage, GuestProtoError>
                 });
             }
         }
-        Some(HostBody::PrepareSnapshot(_)) | Some(HostBody::ResumeWrites(_)) =>
-        {}
+        Some(HostBody::PrepareSnapshot(prepare)) => snapshot_request_id(&prepare.request_id)?,
+        Some(HostBody::ResumeWrites(resume)) => snapshot_request_id(&resume.request_id)?,
         Some(HostBody::Shutdown(shutdown)) =>
         {
             if shutdown.deadline_ms > MAX_SHUTDOWN_DEADLINE_MS
@@ -214,6 +217,18 @@ fn validate_health(health: &Health) -> Result<(), GuestProtoError>
     {
         return Err(GuestProtoError::OutOfRange {
             field: "heap_used_bytes",
+        });
+    }
+    Ok(())
+}
+
+fn snapshot_request_id(request_id: &str) -> Result<(), GuestProtoError>
+{
+    single_line("request_id", request_id, MAX_INSTANCE_ID_BYTES)?;
+    if request_id.is_empty()
+    {
+        return Err(GuestProtoError::Invalid {
+            field: "request_id",
         });
     }
     Ok(())
@@ -376,6 +391,7 @@ mod tests
             GuestBody::SnapshotPrepared(SnapshotPrepared {
                 ok: false,
                 error: "save failed".to_owned(),
+                request_id: "snapshot-1".to_owned(),
             }),
         ];
         for body in bodies
@@ -394,8 +410,12 @@ mod tests
                 command: "say hi".to_owned(),
                 request_id: "test-command".to_owned(),
             }),
-            HostBody::PrepareSnapshot(PrepareSnapshot {}),
-            HostBody::ResumeWrites(ResumeWrites {}),
+            HostBody::PrepareSnapshot(PrepareSnapshot {
+                request_id: "snapshot-1".to_owned(),
+            }),
+            HostBody::ResumeWrites(ResumeWrites {
+                request_id: "snapshot-1".to_owned(),
+            }),
             HostBody::Shutdown(Shutdown {
                 deadline_ms: 30_000,
             }),
@@ -646,13 +666,52 @@ mod tests
         assert_eq!(
             decode_guest_message(&guest(GuestBody::SnapshotPrepared(SnapshotPrepared {
                 ok: false,
-                error: over
+                error: over,
+                request_id: "snapshot-1".to_owned(),
             }))),
             Err(GuestProtoError::TooLong {
                 field: "error",
                 max: MAX_ERROR_BYTES
             })
         );
+    }
+
+    #[test]
+    fn snapshot_requests_require_bounded_nonempty_correlation_ids()
+    {
+        for request_id in [
+            String::new(),
+            "x".repeat(MAX_INSTANCE_ID_BYTES + 1),
+            "a\nb".to_owned(),
+        ]
+        {
+            for body in [
+                HostBody::PrepareSnapshot(PrepareSnapshot {
+                    request_id: request_id.clone(),
+                }),
+                HostBody::ResumeWrites(ResumeWrites {
+                    request_id: request_id.clone(),
+                }),
+            ]
+            {
+                assert!(decode_host_message(&host(body)).is_err(), "{request_id:?}");
+            }
+        }
+        let old_guest = GuestBody::SnapshotPrepared(SnapshotPrepared {
+            ok: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            decode_guest_message(&guest(old_guest.clone()))
+                .unwrap()
+                .body,
+            Some(old_guest)
+        );
+        let oversized = GuestBody::SnapshotPrepared(SnapshotPrepared {
+            request_id: "x".repeat(MAX_INSTANCE_ID_BYTES + 1),
+            ..Default::default()
+        });
+        assert!(decode_guest_message(&guest(oversized)).is_err());
     }
 
     #[test]
@@ -686,7 +745,8 @@ mod tests
         assert_eq!(
             decode_guest_message(&guest(GuestBody::SnapshotPrepared(SnapshotPrepared {
                 ok: false,
-                error: "x\ny".to_owned()
+                error: "x\ny".to_owned(),
+                request_id: "snapshot-1".to_owned(),
             }))),
             Err(GuestProtoError::ForbiddenCharacter { field: "error" })
         );

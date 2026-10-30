@@ -3,6 +3,87 @@ use proto::v1::{Phase, RestartPolicy, RunState};
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_generation_content_changes_restart_and_keep_the_attached_disk()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "flow-same-generation";
+    let mut spec = fixture.spec(id, "normal");
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    node.wait_running(id, 1).await;
+    let original_pid = fixture.last_pid(id).unwrap();
+    let data_path = fixture
+        .path("volumes")
+        .join(format!("{}.img", volume_name(id, "data")));
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut disk = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .unwrap();
+        disk.seek(SeekFrom::Start(4096)).unwrap();
+        disk.write_all(b"current world contents").unwrap();
+    }
+    spec.env.insert(
+        "SERVER_VERSION".to_owned(),
+        "same-generation-edit".to_owned(),
+    );
+    spec.memory_mib = 1024;
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while fixture.starts(id) < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            node.history(id)
+        );
+        sleep_ms(20).await;
+    }
+    node.wait_running(id, 1).await;
+    assert!(!process_alive(original_pid));
+    assert!(
+        fixture
+            .trace(id)
+            .iter()
+            .any(|line| line.starts_with("configure 1 memory=1024 "))
+    );
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut disk = std::fs::File::open(&data_path).unwrap();
+        disk.seek(SeekFrom::Start(4096)).unwrap();
+        let mut marker = [0; 22];
+        disk.read_exact(&mut marker).unwrap();
+        assert_eq!(&marker, b"current world contents");
+    }
+
+    let previous_pid = fixture.last_pid(id).unwrap();
+    spec.disks[0].name = "replacement".to_owned();
+    node.handle.put_instance(spec).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while fixture.starts(id) < 3 || data_path.exists()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}; {:?}",
+            node.history(id),
+            fixture.volume_files()
+        );
+        sleep_ms(20).await;
+    }
+    node.wait_running(id, 1).await;
+    assert!(!process_alive(previous_pid));
+    let replacement = format!("{}.img", volume_name(id, "replacement"));
+    assert_eq!(fixture.volume_files(), vec![replacement]);
+    assert!(process_alive(fixture.last_pid(id).unwrap()));
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    assert!(fixture.volume_files().is_empty());
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_update_stop_start_and_delete()
 {
     let fixture = Fixture::new().await;
@@ -34,7 +115,10 @@ async fn create_update_stop_start_and_delete()
     let diagnostics = node.handle.diagnostics().await.unwrap().to_string();
     assert!(diagnostics.contains(id));
     assert!(!diagnostics.contains("hunter2"));
-    assert_eq!(fixture.volume_files(), vec!["flow-a-data.img".to_owned()]);
+    assert_eq!(
+        fixture.volume_files(),
+        vec![format!("{}.img", volume_name(id, "data"))]
+    );
     assert_eq!(node.network.attachments().len(), 1);
     assert_eq!(
         fixture

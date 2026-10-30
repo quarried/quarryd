@@ -64,6 +64,7 @@ pub struct NetworkingConfig
     pub state_dir: PathBuf,
     pub uplink_ifname: Option<String>,
     pub nft_bin: PathBuf,
+    pub conntrack_bin: PathBuf,
     pub tc_bin: PathBuf,
     pub wg_bin: PathBuf,
 }
@@ -76,6 +77,7 @@ impl NetworkingConfig
             state_dir,
             uplink_ifname: None,
             nft_bin: PathBuf::from("nft"),
+            conntrack_bin: PathBuf::from("conntrack"),
             tc_bin: PathBuf::from("tc"),
             wg_bin: PathBuf::from("wg"),
         }

@@ -95,6 +95,8 @@ def main():
         "QUARRY_S3_REGION, QUARRY_S3_ENDPOINT, per-bucket QUARRY_ARTIFACTS_{REGION,ENDPOINT} "
         "and QUARRY_SNAPSHOTS_{REGION,ENDPOINT}, QUARRY_VOLUME_GROUP and QUARRY_THIN_POOL. "
         "The systemd unit reads AWS credentials from /etc/quarryd/object-storage.env. "
+        "The Linux host needs nft, tc, and conntrack-tools on PATH "
+        "(Debian/Ubuntu: apt install nftables iproute2 conntrack). "
         "Place the coordinator server CA in /etc/quarryd/coordinator-ca.crt and the issued "
         "single-use join token in /etc/quarryd/join-token. Use AWS_ALLOW_HTTP=true only "
         "when the object store endpoint uses HTTP.",

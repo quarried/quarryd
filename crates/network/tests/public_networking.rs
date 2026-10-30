@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use network::{
-    AttachMode, FakeNetwork, FakeOperation, InstanceNetworkSpec, Network, NetworkError,
+    AttachMode, FakeCall, FakeNetwork, FakeOperation, InstanceNetworkSpec, Network, NetworkError,
     NodeNetwork, PublicIpMode, PublicIpv4Arp, PublicIpv4Config, Subnet, guest_mac, nft,
 };
 use serde_json::{Value, json};
@@ -157,7 +157,7 @@ async fn public_rules_swap_atomically_preserve_sources_and_allow_every_port()
     fake.set_public_mode("a", PublicIpMode::Running)
         .await
         .unwrap();
-    assert_eq!(fake.nft_transactions().len(), before + 1);
+    assert_eq!(fake.nft_transactions().len(), before + 2);
     let running = last_public(&fake);
     let dnat = rules(&running, nft::PUBLIC_DNAT_CHAIN);
     assert_eq!(dnat.len(), 1);
@@ -307,6 +307,137 @@ async fn failed_routed_detach_recovers_an_empty_ruleset_without_proxy_tombstones
     assert!(rules(&last_public(&recovered), nft::PUBLIC_DNAT_CHAIN).is_empty());
     assert!(rules(&last_public(&recovered), nft::PUBLIC_SNAT_CHAIN).is_empty());
     assert!(rules(&last_public(&recovered), nft::PUBLIC_FORWARD_CHAIN).is_empty());
+}
+
+#[tokio::test]
+async fn failed_conntrack_cleanup_keeps_the_address_reserved_until_restart_retries_it()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("network-state.json");
+    let fake = configured(Some(path.clone()), PublicIpv4Arp::Routed).await;
+    fake.attach(&spec("a", 2)).await.unwrap();
+    fake.attach(&spec("b", 3)).await.unwrap();
+    fake.attach_public("a", public_ip()).await.unwrap();
+    fake.set_public_mode("a", PublicIpMode::Running)
+        .await
+        .unwrap();
+    fake.fail_next(
+        FakeOperation::CleanupPublic,
+        "conntrack deletion interrupted",
+    );
+    assert!(fake.detach_public("a").await.is_err());
+    let guard = fake.nft_transactions().last().unwrap().clone();
+    assert_eq!(rules(&guard, nft::PUBLIC_RETIREMENT_CHAIN).len(), 2);
+    assert!(rules(&guard, nft::PUBLIC_DNAT_CHAIN).is_empty());
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        persisted["public"]["retired_bindings"],
+        json!([
+            {"address": "203.0.113.9", "guest_ip": "10.0.0.2"}
+        ])
+    );
+    assert!(
+        fake.validate_public_ipv4("b", &public_ip().to_string())
+            .is_err()
+    );
+    assert!(fake.attach_public("b", public_ip()).await.is_err());
+    drop(fake);
+    tokio::task::yield_now().await;
+
+    let recovered = FakeNetwork::new(Some(path.clone())).unwrap();
+    assert!(
+        recovered
+            .calls()
+            .contains(&FakeCall::CleanupPublic(public_ip()))
+    );
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["public"]["retired_bindings"], json!([]));
+    recovered.attach_public("b", public_ip()).await.unwrap();
+    assert_eq!(recovered.public_bindings().get("b"), Some(&public_ip()));
+}
+
+#[tokio::test]
+async fn address_guest_and_running_mode_changes_retire_connections_but_replays_do_not()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("network-state.json");
+    let fake = configured(Some(path.clone()), PublicIpv4Arp::Routed).await;
+    fake.attach(&spec("a", 2)).await.unwrap();
+    fake.attach_public("a", public_ip()).await.unwrap();
+    fake.set_public_mode("a", PublicIpMode::Running)
+        .await
+        .unwrap();
+    let calls = fake.calls();
+    let cleanups = calls
+        .iter()
+        .filter(|call| matches!(call, FakeCall::CleanupPublic(_)))
+        .count();
+    assert_eq!(cleanups, 1);
+    fake.attach_public("a", public_ip()).await.unwrap();
+    fake.set_public_mode("a", PublicIpMode::Running)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|call| matches!(call, FakeCall::CleanupPublic(_)))
+            .count(),
+        cleanups,
+    );
+
+    fake.fail_next(
+        FakeOperation::CleanupPublic,
+        "guest address cleanup interrupted",
+    );
+    assert!(fake.attach(&spec("a", 4)).await.is_err());
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["public"]["bindings"]["a"]["guest_ip"], "10.0.0.4");
+    assert_eq!(
+        persisted["public"]["retired_bindings"][0]["guest_ip"],
+        "10.0.0.2"
+    );
+    fake.attach(&spec("a", 4)).await.unwrap();
+    assert_eq!(fake.public_mode("a"), Some(PublicIpMode::Starting));
+
+    fake.fail_next(
+        FakeOperation::CleanupPublic,
+        "public address cleanup interrupted",
+    );
+    assert!(
+        fake.attach_public("a", "198.51.100.2".parse().unwrap())
+            .await
+            .is_err()
+    );
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        persisted["public"]["retired_bindings"],
+        json!([
+            {"address": "203.0.113.9", "guest_ip": "10.0.0.4"}
+        ])
+    );
+    fake.attach_public("a", "198.51.100.2".parse().unwrap())
+        .await
+        .unwrap();
+    fake.set_public_mode("a", PublicIpMode::Running)
+        .await
+        .unwrap();
+    fake.fail_next(
+        FakeOperation::CleanupPublic,
+        "sleep transition cleanup interrupted",
+    );
+    assert!(
+        fake.set_public_mode("a", PublicIpMode::Hibernated)
+            .await
+            .is_err()
+    );
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        persisted["public"]["retired_bindings"][0]["address"],
+        "198.51.100.2"
+    );
+    fake.set_public_mode("a", PublicIpMode::Hibernated)
+        .await
+        .unwrap();
 }
 
 fn varint(mut value: u32, output: &mut Vec<u8>)

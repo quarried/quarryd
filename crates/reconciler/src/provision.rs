@@ -5,23 +5,34 @@ use std::time::Instant;
 
 use network::{AttachMode, InstanceNetworkSpec, NetworkAttachment, guest_mac};
 use proto::v1::{ArtifactRef, InstanceSpec};
-use sandbox::{SandboxKind, SandboxNetwork, SandboxSpec};
+use sandbox::{LaunchControl, SandboxKind, SandboxNetwork, SandboxSpec};
 use volume::{ArtifactDescriptor, ArtifactKind, VolumeInfo};
 
 use crate::ReconcilerError;
-use crate::admission::volume_name;
-use crate::reconciler::lock;
+use crate::admission::{legacy_volume_name, volume_name};
+use crate::reconciler::{Inner, decode_spec, lock};
 use crate::supervisor::Supervisor;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const RESTORE_PENDING: &str = "pending:";
 const RESTORE_DONE: &str = "done:";
 
+/// A dropped supervisor future must also withdraw a detached launch worker's
+/// permission to start. Backends retain ownership until cancellation settles.
+struct CancelLaunchOnDrop(LaunchControl);
+
+impl Drop for CancelLaunchOnDrop
+{
+    fn drop(&mut self)
+    {
+        self.0.cancel();
+    }
+}
+
 /// Everything a boot needs, produced by preparation (section 7).
 #[derive(Clone, Debug)]
 pub(crate) struct Prepared
 {
-    pub generation: u64,
     pub kernel: Option<PathBuf>,
     pub rootfs: PathBuf,
     pub volume: VolumeInfo,
@@ -32,6 +43,103 @@ pub(crate) struct Prepared
 pub(crate) fn restore_key(volume: &str) -> String
 {
     format!("reconciler/restore/{volume}")
+}
+
+/// Resolve an old disk in place or claim a new collision-resistant name. The
+/// binding is durable before any volume mutation, including creation.
+pub(crate) async fn resolve_disk_name(
+    inner: &Inner,
+    instance_id: &str,
+    disk_name: &str,
+) -> Result<String, ReconcilerError>
+{
+    let _guard = inner.disk_lock.lock().await;
+    resolve_disk_name_locked(inner, instance_id, disk_name).await
+}
+
+async fn resolve_disk_name_locked(
+    inner: &Inner,
+    instance_id: &str,
+    disk_name: &str,
+) -> Result<String, ReconcilerError>
+{
+    let store = &inner.parts.store;
+    if let Some(name) = store.disk_binding(instance_id, disk_name)?
+    {
+        store.assert_disk_owner(instance_id, &name)?;
+        return Ok(name);
+    }
+    let backend = inner.parts.volumes.backend();
+    let fresh = volume_name(instance_id, disk_name);
+    let legacy = legacy_volume_name(instance_id, disk_name);
+    let legacy_exists = backend.get(&legacy).await?.is_some();
+    let legacy_tracked = store.instance_disks(instance_id)?.contains(&legacy);
+    if legacy_tracked
+    {
+        store.assert_disk_owner(instance_id, &legacy)?;
+    }
+    let unbound_legacy = (legacy_exists || legacy_tracked) && store.bound_disk(&legacy)?.is_none();
+    let name = if unbound_legacy
+    {
+        if !legacy_tracked
+        {
+            let detail = "pre-existing legacy volume has no durable owner; manual ownership recovery is required";
+            store.quarantine_disk(&legacy, detail)?;
+            return Err(store::StoreError::DiskOwnership {
+                name: legacy,
+                detail: detail.to_owned(),
+            }
+            .into());
+        }
+        // Prior releases recorded only sanitized names. Check every desired and
+        // applied spec before giving the old name to the first startup caller.
+        for row in store.list_instances()?
+        {
+            for bytes in std::iter::once(row.spec.as_slice()).chain(row.applied_spec.as_deref())
+            {
+                let spec = decode_spec(bytes)?;
+                for disk in &spec.disks
+                {
+                    if (row.id != instance_id || disk.name != disk_name)
+                        && legacy_volume_name(&row.id, &disk.name) == legacy
+                    {
+                        let detail =
+                            format!("legacy name also matches {:?}/{:?}", row.id, disk.name);
+                        store.quarantine_disk(&legacy, &detail)?;
+                        return Err(store::StoreError::DiskOwnership {
+                            name: legacy,
+                            detail,
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+        if fresh != legacy && backend.get(&fresh).await?.is_some()
+        {
+            let detail = format!("both legacy and new volume {fresh:?} exist without a binding");
+            store.quarantine_disk(&legacy, &detail)?;
+            store.quarantine_disk(&fresh, &detail)?;
+            return Err(store::StoreError::DiskOwnership {
+                name: legacy,
+                detail,
+            }
+            .into());
+        }
+        legacy
+    }
+    else
+    {
+        if backend.get(&fresh).await?.is_some()
+        {
+            // Never adopt an unrelated pre-existing LV merely because its name
+            // happens to match the generated identity.
+            store.assert_disk_owner(instance_id, &fresh)?;
+        }
+        fresh
+    };
+    store.claim_disk(instance_id, disk_name, &name)?;
+    Ok(name)
 }
 
 fn descriptor(artifact: &ArtifactRef) -> ArtifactDescriptor
@@ -168,7 +276,6 @@ impl Supervisor
             "instance prepared"
         );
         Ok(Prepared {
-            generation: spec.generation,
             kernel,
             rootfs,
             volume,
@@ -202,8 +309,7 @@ impl Supervisor
             .disks
             .first()
             .ok_or(ReconcilerError::MissingField("disk"))?;
-        let name = volume_name(&self.id, &disk.name);
-        self.inner.parts.store.remember_disk(&self.id, &name)?;
+        let name = resolve_disk_name(&self.inner, &self.id, &disk.name).await?;
         let size = disk.size_gib.saturating_mul(GIB);
         let volumes = &self.inner.parts.volumes;
         let manifest = disk
@@ -234,9 +340,9 @@ impl Supervisor
             }
             None =>
             {
-                if let Some(existing) = volumes.backend().get(&name).await?
+                if volumes.backend().get(&name).await?.is_some()
                 {
-                    return Ok(existing);
+                    return Ok(volumes.ensure(&name, size).await?);
                 }
             }
         }
@@ -268,15 +374,25 @@ impl Supervisor
             return Ok(());
         }
         let desired = crate::reconciler::decode_spec(&row.spec)?;
-        let keep: Vec<String> = desired
-            .disks
-            .iter()
-            .map(|disk| volume_name(&self.id, &disk.name))
-            .collect();
+        let Some(applied) = self.running_spec.as_deref()
+        else
+        {
+            return Ok(());
+        };
+        if !crate::supervisor::same_runtime_spec(applied, &desired)
+        {
+            return Ok(());
+        }
+        let mut keep = Vec::new();
+        for disk in &applied.disks
+        {
+            keep.push(resolve_disk_name_locked(&self.inner, &self.id, &disk.name).await?);
+        }
         for name in self.inner.parts.store.instance_disks(&self.id)?
         {
             if !keep.contains(&name)
             {
+                self.inner.parts.store.assert_disk_owner(&self.id, &name)?;
                 self.inner.parts.volumes.remove(&name).await?;
                 self.inner.parts.store.kv_delete(&restore_key(&name))?;
                 self.inner.parts.store.forget_disk(&self.id, &name)?;
@@ -332,19 +448,56 @@ impl Supervisor
             .clone()
             .ok_or(ReconcilerError::MissingField("prepared resources"))?;
         let spec = self
-            .running_spec
+            .prepared_spec
             .clone()
             .ok_or(ReconcilerError::MissingField("spec"))?;
         self.bind_guest()?;
+        let mut authority_lost = self.launch_authority_lost(Arc::clone(&spec));
+        // Poll the authority guard before giving the backend any permission.
+        tokio::select! {
+            biased;
+            error = &mut authority_lost => return Err(error),
+            _ = std::future::ready(()) => {}
+        }
         let sandbox_spec = self.sandbox_spec(&prepared, &spec);
         let sandbox = Arc::clone(&self.inner.parts.sandbox);
-        let handle = tokio::spawn(async move { sandbox.launch(&sandbox_spec).await }).await??;
+        let control = LaunchControl::default();
+        let _cancel_on_drop = CancelLaunchOnDrop(control.clone());
+        let worker_control = control.clone();
+        let mut worker = tokio::spawn(async move {
+            sandbox
+                .launch_controlled(&sandbox_spec, worker_control)
+                .await
+        });
+        let handle = tokio::select! {
+            biased;
+            error = &mut authority_lost => {
+                control.cancel();
+                // Never release/reuse the disk, UID or network while a launch
+                // worker can still complete. The backend observes cancellation
+                // during preparation/readiness and settles its unit ownership.
+                match worker.await {
+                    Ok(Ok(handle)) => {
+                        // Cancellation can race the final successful return.
+                        // Persist the handle so fail()/recovery must stop it.
+                        self.handle = Some(handle);
+                        self.running_spec = Some(spec);
+                        self.commit()?;
+                    }
+                    Ok(Err(cleanup)) => tracing::warn!(error = %cleanup, "cancelled launch completed with an error; sandbox recovery will verify cleanup"),
+                    Err(cleanup) => tracing::warn!(error = %cleanup, "cancelled launch task failed; sandbox recovery will verify cleanup"),
+                }
+                return Err(error);
+            }
+            result = &mut worker => result??,
+        };
         tracing::info!(
             unit = %handle.record().unit_name,
             pid = ?handle.record().pid,
             "sandbox launched"
         );
         self.handle = Some(handle);
+        self.running_spec = Some(spec);
         self.commit()?;
         self.checkpoint("after-launch").await;
         Ok(())
@@ -352,7 +505,7 @@ impl Supervisor
 
     pub(crate) async fn release_resources(
         &mut self,
-        spec: &InstanceSpec,
+        _spec: &InstanceSpec,
     ) -> Result<(), ReconcilerError>
     {
         let parts = &self.inner.parts;
@@ -363,14 +516,10 @@ impl Supervisor
             ipam.release(&self.id);
         }
         self.checkpoint("after-detach").await;
-        for disk in &spec.disks
-        {
-            parts
-                .store
-                .remember_disk(&self.id, &volume_name(&self.id, &disk.name))?;
-        }
+        let _disk_guard = self.inner.disk_lock.lock().await;
         for name in parts.store.instance_disks(&self.id)?
         {
+            parts.store.assert_disk_owner(&self.id, &name)?;
             parts.volumes.remove(&name).await?;
             parts.store.kv_delete(&restore_key(&name))?;
             parts.store.forget_disk(&self.id, &name)?;

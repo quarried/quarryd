@@ -310,12 +310,17 @@ async fn session(
                                .await;
                                return SessionEnd::Exit(0);
                            }
-                           Some(HostBody::PrepareSnapshot(_)) =>
+                           Some(HostBody::PrepareSnapshot(prepare)) =>
                            {
                                trace("prepare-snapshot");
                                let prepared = GuestBody::SnapshotPrepared(SnapshotPrepared {
                                    ok: true,
                                    error: String::new(),
+                                   request_id: if mode == "stale-snapshot" {
+                                       "previous-snapshot-request".to_owned()
+                                   } else {
+                                       prepare.request_id
+                                   },
                                });
                                if !send(&mut write, prepared).await
                                {

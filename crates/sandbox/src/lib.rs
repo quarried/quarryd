@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -115,13 +117,77 @@ pub enum SandboxState
     Missing,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LaunchControl
+{
+    cancelled: Arc<AtomicBool>,
+}
+
+impl LaunchControl
+{
+    pub fn cancel(&self)
+    {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool
+    {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn check(&self) -> Result<(), SandboxError>
+    {
+        if self.is_cancelled()
+        {
+            Err(SandboxError::LaunchCancelled)
+        }
+        else
+        {
+            Ok(())
+        }
+    }
+}
+
 #[async_trait]
 pub trait Sandbox: Send + Sync
 {
     fn kind(&self) -> SandboxKind;
     fn guest_socket_path(&self, instance_id: &str) -> PathBuf;
-    async fn launch(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError>;
+    fn guest_socket_owner(&self, uid: u32, gid: u32) -> (u32, u32)
+    {
+        if self.kind() == SandboxKind::Fake
+        {
+            (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw())
+        }
+        else
+        {
+            (uid, gid)
+        }
+    }
+    fn requires_restart(&self, _record: &SandboxRecord) -> bool
+    {
+        false
+    }
+    async fn launch(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError>
+    {
+        self.launch_controlled(spec, LaunchControl::default()).await
+    }
+    async fn launch_controlled(
+        &self,
+        spec: &SandboxSpec,
+        control: LaunchControl,
+    ) -> Result<SandboxHandle, SandboxError>;
     async fn adopt(&self, record: &SandboxRecord) -> Result<Option<SandboxHandle>, SandboxError>;
+    /// Recover ownership for cleanup, without requiring a ready guest or runtime API.
+    ///
+    /// A missing record must not hide a unit started before its launch was committed.
+    /// `None` means absence was established; an uncertain identity or backend error
+    /// must be returned as an error so the caller retains ownership and retries.
+    async fn recover(
+        &self,
+        instance_id: &str,
+        record: Option<&SandboxRecord>,
+    ) -> Result<Option<SandboxHandle>, SandboxError>;
     async fn shutdown(
         &self,
         handle: &SandboxHandle,

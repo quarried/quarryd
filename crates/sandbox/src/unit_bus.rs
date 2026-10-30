@@ -23,6 +23,7 @@ pub struct TransientServiceProperties
     pub cpu_quota_per_sec_usec: Option<u64>,
     pub memory_max: Option<u64>,
     pub allowed_cpus: Option<Vec<u32>>,
+    pub io_accounting: bool,
     pub delegate: bool,
     pub exec_stop_post: Vec<Vec<String>>,
     pub environment: Vec<String>,
@@ -86,6 +87,10 @@ impl TransientServiceProperties
         if let Some(cpus) = &self.allowed_cpus
         {
             properties.push(("AllowedCPUs".into(), Variant::from(cpu_mask(cpus))));
+        }
+        if self.io_accounting
+        {
+            properties.push(("IOAccounting".into(), Variant::from(true)));
         }
         if self.delegate
         {
@@ -172,6 +177,14 @@ impl UnitBus
         let properties = properties.to_dbus(exec)?;
         let auxiliary: Vec<(String, Vec<Property>)> = Vec::new();
         self.call_systemd("StartTransientUnit", &(name, "fail", properties, auxiliary))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn enable_io_accounting(&self, name: &str) -> Result<(), SandboxError>
+    {
+        let properties: Vec<Property> = vec![("IOAccounting".into(), Variant::from(true))];
+        self.call_systemd("SetUnitProperties", &(name, true, properties))
             .await?;
         Ok(())
     }
@@ -306,6 +319,7 @@ mod tests
             cpu_quota_per_sec_usec: Some(2_000_000),
             memory_max: Some(1 << 30),
             allowed_cpus: Some(vec![2, 3]),
+            io_accounting: true,
             exec_stop_post: vec![vec!["/bin/true".into()]],
             ..Default::default()
         };
@@ -324,6 +338,7 @@ mod tests
                 "CPUQuotaPerSecUSec",
                 "MemoryMax",
                 "AllowedCPUs",
+                "IOAccounting",
                 "ExecStopPost"
             ]
         );
@@ -331,7 +346,17 @@ mod tests
         assert_eq!(String::try_from(restart).unwrap(), "no");
         assert_eq!(encoded[1].1.value_signature().to_string(), "a(sasb)");
         assert_eq!(encoded[7].1.value_signature().to_string(), "ay");
+        assert!(bool::try_from(&encoded[8].1).unwrap());
         assert_eq!(u64::try_from(&encoded[5].1).unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn io_accounting_is_not_requested_for_unrelated_units()
+    {
+        let encoded = TransientServiceProperties::default()
+            .to_dbus(&["/bin/true".to_string()])
+            .unwrap();
+        assert!(!encoded.iter().any(|(name, _)| name == "IOAccounting"));
     }
 
     #[test]
@@ -350,6 +375,7 @@ mod tests
             description: "quarry sandbox systemd test".into(),
             kill_mode: Some("control-group".into()),
             cpu_quota_per_sec_usec: Some(500_000),
+            io_accounting: true,
             ..Default::default()
         };
         systemd
@@ -371,12 +397,14 @@ mod tests
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(state.as_deref(), Some("active"));
+        systemd.enable_io_accounting(&name).await.unwrap();
         let pid = systemd.unit_main_pid(&name).await.unwrap().unwrap();
         assert!(pid > 1);
         let group = systemd.unit_control_group(&name).await.unwrap().unwrap();
         assert!(group.ends_with(&name));
         let quota = std::fs::read_to_string(format!("/sys/fs/cgroup{group}/cpu.max")).unwrap();
         assert_eq!(quota.trim(), "50000 100000");
+        assert!(std::path::Path::new(&format!("/sys/fs/cgroup{group}/io.stat")).exists());
         systemd.kill_unit(&name, Signal::SIGKILL).await.unwrap();
         for _ in 0..100
         {

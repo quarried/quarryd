@@ -13,7 +13,9 @@ const MARKERS: [(u64, &[u8]); 2] = [
 
 fn volume_path(fixture: &Fixture, id: &str) -> PathBuf
 {
-    fixture.path("volumes").join(format!("{id}-data.img"))
+    fixture
+        .path("volumes")
+        .join(format!("{}.img", volume_name(id, "data")))
 }
 
 fn write_markers(path: &std::path::Path)
@@ -72,7 +74,7 @@ async fn snapshots_are_world_consistent_and_restorable()
         .unwrap();
     let manifest: SnapshotManifest = serde_json::from_slice(&stored).unwrap();
     assert_eq!(manifest.lease_epoch, 7);
-    assert_eq!(manifest.source, "snap-src-data");
+    assert_eq!(manifest.source, volume_name(source, "data"));
     assert_eq!(manifest.total_size, GIB);
     assert_eq!(
         manifest.chunks.iter().filter(|c| c.key.is_some()).count(),
@@ -83,7 +85,10 @@ async fn snapshots_are_world_consistent_and_restorable()
     let prepared = trace.iter().position(|l| l == "prepare-snapshot").unwrap();
     let resumed = trace.iter().position(|l| l == "resume-writes").unwrap();
     assert!(prepared < resumed, "{trace:?}");
-    assert_eq!(fixture.volume_files(), vec!["snap-src-data.img".to_owned()]);
+    assert_eq!(
+        fixture.volume_files(),
+        vec![format!("{}.img", volume_name(source, "data"))]
+    );
     assert_eq!(
         node.status(source).map(|s| phase_of(&s)),
         Some(Phase::Running)
@@ -102,7 +107,10 @@ async fn snapshots_are_world_consistent_and_restorable()
     assert_eq!(read_markers(&volume_path(&fixture, restored)), expected);
     let restore_marker = fixture
         .store
-        .kv_get("reconciler/restore/snap-dst-data")
+        .kv_get(&format!(
+            "reconciler/restore/{}",
+            volume_name(restored, "data")
+        ))
         .unwrap()
         .unwrap();
     assert!(String::from_utf8_lossy(&restore_marker).starts_with("done:"));
@@ -125,7 +133,10 @@ async fn snapshots_are_world_consistent_and_restorable()
     assert!(
         fixture
             .store
-            .kv_get("reconciler/restore/snap-dst-data")
+            .kv_get(&format!(
+                "reconciler/restore/{}",
+                volume_name(restored, "data")
+            ))
             .unwrap()
             .is_none()
     );
@@ -157,6 +168,85 @@ async fn snapshots_require_a_running_instance_with_a_connected_guest()
             .get(&ObjectPath::from("snapshots/x/manifest.json"))
             .await
             .is_err()
+    );
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_work_cannot_outlive_the_guest_freeze_deadline()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "snap-freeze-deadline";
+    node.handle
+        .put_instance(fixture.spec(id, "normal"))
+        .await
+        .unwrap();
+    node.wait_running(id, 1).await;
+    crash::arm(id, "after-snapshot-prepared");
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        node.handle.snapshot_now(id, "deadline-expired"),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "snapshot must fail within the freeze budget: {result:?}"
+    );
+    assert!(crash::was_hit(id, "after-snapshot-prepared"));
+    fixture.wait_trace(id, "resume-writes").await;
+    assert!(
+        fixture
+            .snapshot_objects
+            .get(&ObjectPath::from("deadline-expired/manifest.json"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture.volume_files(),
+        vec![format!("{}.img", volume_name(id, "data"))]
+    );
+    assert!(process_alive(fixture.last_pid(id).unwrap()));
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_acknowledgement_from_a_previous_request_cannot_authorize_a_snapshot()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "snap-stale-ack";
+    node.handle
+        .put_instance(fixture.spec(id, "stale-snapshot"))
+        .await
+        .unwrap();
+    node.wait_running(id, 1).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        node.handle.snapshot_now(id, "stale-ack"),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "an unrelated preparation ack was accepted: {result:?}"
+    );
+    fixture.wait_trace(id, "resume-writes").await;
+    assert!(
+        fixture
+            .snapshot_objects
+            .get(&ObjectPath::from("stale-ack/manifest.json"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture.volume_files(),
+        vec![format!("{}.img", volume_name(id, "data"))]
     );
     node.handle.delete_instance(id).await.unwrap();
     node.wait_gone(id, &fixture.store).await;

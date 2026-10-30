@@ -1,9 +1,10 @@
 mod command;
+mod conntrack;
 mod netlink;
 mod netns;
 mod tun;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr};
@@ -53,6 +54,15 @@ struct InstanceRecord
 {
     spec: InstanceNetworkSpec,
     complete: bool,
+    #[serde(default)]
+    retired_worlds: BTreeSet<WorldIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct WorldIdentity
+{
+    set_name: String,
+    guest_ip: Ipv4Addr,
 }
 
 impl InstanceRecord
@@ -70,23 +80,80 @@ impl InstanceRecord
     {
         world_set_name(&self.spec.world_id, &self.spec.instance_id)
     }
+
+    fn world(&self) -> WorldIdentity
+    {
+        WorldIdentity {
+            set_name: self.world_set(),
+            guest_ip: self.spec.guest_ip,
+        }
+    }
 }
 
 impl PersistedState
 {
-    fn world_membership(&self, instance_id: &str) -> Option<WorldMembership>
+    fn membership_removal(&self, instance_id: &str, world: &WorldIdentity) -> WorldMembership
     {
-        let record = self.instances.get(instance_id)?;
-        let set_name = record.world_set();
         let shared = self
             .instances
             .iter()
-            .any(|(other_id, other)| other_id != instance_id && other.world_set() == set_name);
-        Some(WorldMembership {
-            set_name,
-            guest_ip: record.spec.guest_ip,
+            .any(|(other_id, other)| {
+                other_id != instance_id
+                    && (other.world_set() == world.set_name
+                        || other
+                            .retired_worlds
+                            .iter()
+                            .any(|retired| retired.set_name == world.set_name))
+            });
+        WorldMembership {
+            set_name: world.set_name.clone(),
+            guest_ip: world.guest_ip,
             remove_set: !shared,
-        })
+        }
+    }
+
+    fn retired_world_memberships(&self, instance_id: &str) -> Vec<WorldMembership>
+    {
+        self.instances
+            .get(instance_id)
+            .into_iter()
+            .flat_map(|record| &record.retired_worlds)
+            .map(|world| self.membership_removal(instance_id, world))
+            .collect()
+    }
+
+    fn all_world_memberships(&self, instance_id: &str) -> Vec<WorldMembership>
+    {
+        let mut worlds = self.retired_world_memberships(instance_id);
+        if let Some(record) = self.instances.get(instance_id)
+        {
+            worlds.push(self.membership_removal(instance_id, &record.world()));
+        }
+        worlds
+    }
+
+    fn stage_instance(&mut self, spec: &InstanceNetworkSpec, reuse_links: bool)
+    {
+        let mut retired_worlds = BTreeSet::new();
+        if let Some(previous) = self.instances.get(&spec.instance_id)
+            && previous.has_same_links(spec)
+        {
+            retired_worlds = previous.retired_worlds.clone();
+            retired_worlds.insert(previous.world());
+        }
+        // Returning to a previously requested world must retain its current membership.
+        retired_worlds.remove(&WorldIdentity {
+            set_name: world_set_name(&spec.world_id, &spec.instance_id),
+            guest_ip: spec.guest_ip,
+        });
+        self.instances.insert(
+            spec.instance_id.clone(),
+            InstanceRecord {
+                spec: spec.clone(),
+                complete: reuse_links,
+                retired_worlds,
+            },
+        );
     }
 }
 
@@ -142,6 +209,7 @@ impl Networking
             return Ok(());
         }
         self.persist(state)?;
+        self.clear_retired_connections(state).await?;
         self.apply_nft(&nft::public_rules(&state.public), None)
             .await?;
         let desired = state.public.proxies();
@@ -161,10 +229,34 @@ impl Networking
                 netlink::replace_proxy_neighbour(&host, &proxy.interface, proxy.address).await?;
             }
         }
-        state.public.retired_proxies.clear();
-        self.persist(state)?;
+        let mut settled = state.clone();
+        settled.public.retired_proxies.clear();
+        settled.public.retired_bindings.clear();
+        self.persist(&settled)?;
+        *state = settled;
         self.responder.publish(&state.public);
         state.applied_public = Some(state.public.clone());
+        Ok(())
+    }
+
+    async fn clear_retired_connections(&self, state: &PersistedState) -> Result<(), NetworkError>
+    {
+        if state.public.retired_bindings.is_empty()
+        {
+            return Ok(());
+        }
+        self.apply_nft(&nft::public_retirement_guard(&state.public), None)
+            .await?;
+        let addresses: BTreeSet<_> = state
+            .public
+            .retired_bindings
+            .iter()
+            .map(|binding| binding.address)
+            .collect();
+        for address in addresses
+        {
+            conntrack::remove_public_address(&self.config.conntrack_bin, address).await?;
+        }
         Ok(())
     }
 
@@ -408,8 +500,8 @@ impl Networking
     ) -> Result<(), NetworkError>
     {
         let names = InterfaceNames::for_instance(instance_id);
-        let world = state.world_membership(instance_id);
-        self.apply_nft(&nft::instance_removal(instance_id, world.as_ref()), None)
+        let worlds = state.all_world_memberships(instance_id);
+        self.apply_nft(&nft::instance_removal_with_worlds(instance_id, &worlds), None)
             .await?;
         match self
             .apply_nft(&nft::host_guard_removal(instance_id), None)
@@ -463,6 +555,10 @@ impl Network for Networking
     -> Result<(), NetworkError>
     {
         let mut state = self.state.lock().await;
+        if !state.public.retired_bindings.is_empty()
+        {
+            self.apply_public(&mut state).await?;
+        }
         let guest_ip = state
             .instances
             .get(instance_id)
@@ -487,9 +583,12 @@ impl Network for Networking
     ) -> Result<(), NetworkError>
     {
         let mut state = self.state.lock().await;
-        if let Some(binding) = state.public.bindings.get_mut(instance_id)
+        if state.public.bindings.contains_key(instance_id)
         {
-            binding.mode = mode;
+            state.public.set_mode(instance_id, mode);
+        }
+        if state.public.bindings.contains_key(instance_id) || !state.public.retired_bindings.is_empty()
+        {
             self.apply_public(&mut state).await?;
         }
         Ok(())
@@ -570,46 +669,47 @@ impl Network for Networking
         let reuse_links = previous
             .as_ref()
             .is_some_and(|record| record.complete && record.has_same_links(spec));
+        let public_ip_changed = state
+            .public
+            .bindings
+            .get(&spec.instance_id)
+            .is_some_and(|binding| binding.guest_ip != spec.guest_ip);
+        if public_ip_changed
+        {
+            // Keep the public address on its responder if a crash interrupts the
+            // private route replacement. Revoke its old flows before removing links.
+            state.public.set_mode(&spec.instance_id, PublicIpMode::Starting);
+            state.public.update_guest_ip(&spec.instance_id, spec.guest_ip);
+        }
+        if !state.public.retired_bindings.is_empty()
+        {
+            self.persist(&state)?;
+            self.clear_retired_connections(&state).await?;
+        }
         if let Some(record) = &previous
             && !record.has_same_links(spec)
         {
             info!(instance_id = %spec.instance_id, "link parameters changed, rebuilding the attachment");
             self.remove_instance(&state, &spec.instance_id).await?;
         }
-        let stale_world = previous
-            .as_ref()
-            .filter(|record| {
-                record.has_same_links(spec)
-                    && record.world_set() != world_set_name(&spec.world_id, &spec.instance_id)
-            })
-            .and_then(|_| state.world_membership(&spec.instance_id));
-
-        state.instances.insert(
-            spec.instance_id.clone(),
-            InstanceRecord {
-                spec: spec.clone(),
-                complete: reuse_links,
-            },
-        );
+        state.stage_instance(spec, reuse_links);
         self.persist(&state)?;
 
         self.attach_links(spec, subnet, reuse_links).await?;
-        self.apply_nft(&nft::instance_rules(spec), None).await?;
-        if let Some(world) = stale_world
-        {
-            self.apply_nft(&nft::world_membership_removal(&world), None)
-                .await?;
-        }
+        let retired = state.retired_world_memberships(&spec.instance_id);
+        self.apply_nft(&nft::instance_rules_with_retirements(spec, &retired), None)
+            .await?;
         self.apply_egress_limit(&names.host_veth, spec.egress_mbit)
             .await?;
 
         if let Some(record) = state.instances.get_mut(&spec.instance_id)
         {
             record.complete = true;
+            record.retired_worlds.clear();
         }
-        if let Some(binding) = state.public.bindings.get_mut(&spec.instance_id)
+        if state.public.bindings.contains_key(&spec.instance_id)
+            || !state.public.retired_bindings.is_empty()
         {
-            binding.guest_ip = spec.guest_ip;
             self.apply_public(&mut state).await?;
         }
         self.persist(&state)?;
@@ -671,5 +771,80 @@ impl Network for Networking
             });
         }
         Ok(Some(public_key))
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn spec(id: &str, world: &str, ip: Ipv4Addr) -> InstanceNetworkSpec
+    {
+        InstanceNetworkSpec {
+            instance_id: id.to_string(),
+            world_id: world.to_string(),
+            guest_ip: ip,
+            guest_mac: crate::guest_mac(ip),
+            egress_mbit: 0,
+            ports: Vec::new(),
+            mode: AttachMode::Veth,
+            uid: 10_000,
+            gid: 10_000,
+        }
+    }
+
+    #[test]
+    fn world_retirement_survives_restart_and_repeated_failed_updates()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(STATE_FILE);
+        let mut state = PersistedState::default();
+        let mut moving = spec("moving", "old", Ipv4Addr::new(10, 0, 0, 2));
+        state.stage_instance(&moving, false);
+        moving.world_id = "intermediate".to_string();
+        state.stage_instance(&moving, true);
+        state_file::save(&path, &state).unwrap();
+
+        // The process died after saving the new spec but before applying its rules.
+        let mut recovered: PersistedState = state_file::load(&path).unwrap().unwrap();
+        recovered.stage_instance(&moving, true);
+        moving.world_id = "final".to_string();
+        recovered.stage_instance(&moving, true);
+        let retired = recovered.retired_world_memberships("moving");
+        assert_eq!(retired.len(), 2);
+        for world in ["old", "intermediate"]
+        {
+            assert!(retired.iter().any(|membership| {
+                membership.set_name == world_set_name(world, "moving")
+                    && membership.guest_ip == moving.guest_ip
+                    && membership.remove_set
+            }));
+        }
+
+        // A later desired state can return to an earlier world before cleanup succeeds.
+        moving.world_id = "old".to_string();
+        recovered.stage_instance(&moving, true);
+        assert!(recovered.retired_world_memberships("moving").iter().all(|membership| {
+            membership.set_name != world_set_name("old", "moving")
+        }));
+    }
+
+    #[test]
+    fn another_unfinished_world_change_keeps_its_referenced_set()
+    {
+        let mut state = PersistedState::default();
+        let mut first = spec("first", "old", Ipv4Addr::new(10, 0, 0, 2));
+        let mut second = spec("second", "old", Ipv4Addr::new(10, 0, 0, 3));
+        state.stage_instance(&first, false);
+        state.stage_instance(&second, false);
+        first.world_id = "first-new".to_string();
+        second.world_id = "second-new".to_string();
+        state.stage_instance(&first, true);
+        state.stage_instance(&second, true);
+        assert!(!state.retired_world_memberships("first")[0].remove_set);
+        state.instances.get_mut("first").unwrap().retired_worlds.clear();
+        assert!(state.retired_world_memberships("second")[0].remove_set);
+        assert_eq!(state.all_world_memberships("second").len(), 2);
     }
 }

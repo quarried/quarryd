@@ -26,6 +26,7 @@ pub const PUBLIC_DNAT_CHAIN: &str = "public_dnat";
 pub const PUBLIC_SNAT_CHAIN: &str = "public_snat";
 pub const PUBLIC_INGRESS_CHAIN: &str = "public_ingress";
 pub const PUBLIC_INPUT_CHAIN: &str = "public_input";
+pub const PUBLIC_RETIREMENT_CHAIN: &str = "public_retirement";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorldMembership
@@ -214,6 +215,14 @@ pub fn node_ruleset(subnet: Subnet, uplink_ifname: Option<&str>) -> Value
 
 pub fn instance_rules(spec: &InstanceNetworkSpec) -> Value
 {
+    instance_rules_with_retirements(spec, &[])
+}
+
+pub(crate) fn instance_rules_with_retirements(
+    spec: &InstanceNetworkSpec,
+    retired: &[WorldMembership],
+) -> Value
+{
     let names = InterfaceNames::for_instance(&spec.instance_id);
     let world_set = world_set_name(&spec.world_id, &spec.instance_id);
     let guard = guard_chain(&names);
@@ -314,10 +323,23 @@ pub fn instance_rules(spec: &InstanceNetworkSpec) -> Value
             spec.guest_ip,
         ));
     }
+    // Retire the old memberships in the same transaction that changes the forwarding chain.
+    for world in retired
+    {
+        commands.extend(world_membership_commands(world));
+    }
     batch(commands)
 }
 
 pub fn instance_removal(instance_id: &str, world: Option<&WorldMembership>) -> Value
+{
+    instance_removal_with_worlds(instance_id, world.map(std::slice::from_ref).unwrap_or(&[]))
+}
+
+pub(crate) fn instance_removal_with_worlds(
+    instance_id: &str,
+    worlds: &[WorldMembership],
+) -> Value
 {
     let names = InterfaceNames::for_instance(instance_id);
     let chains = [
@@ -348,7 +370,7 @@ pub fn instance_removal(instance_id: &str, world: Option<&WorldMembership>) -> V
         commands
             .push(json!({"delete": {"chain": {"family": INET, "table": TABLE, "name": chain}}}));
     }
-    if let Some(world) = world
+    for world in worlds
     {
         commands.extend(world_membership_commands(world));
     }
@@ -458,9 +480,42 @@ fn inet_declarations() -> Vec<Value>
     commands
 }
 
+pub(crate) fn public_retirement_guard(public: &PublicState) -> Value
+{
+    let mut commands = vec![add_table(INET)];
+    commands.extend(public_retirement_chain());
+    for binding in &public.retired_bindings
+    {
+        for (field, address) in [("daddr", binding.address), ("saddr", binding.guest_ip)]
+        {
+            commands.push(rule(
+                INET,
+                PUBLIC_RETIREMENT_CHAIN,
+                vec![compare("==", ip_field(field), json!(address.to_string())), drop()],
+            ));
+        }
+    }
+    batch(commands)
+}
+
+fn public_retirement_chain() -> [Value; 2]
+{
+    replaced_base_chain(
+        INET,
+        PUBLIC_RETIREMENT_CHAIN,
+        "filter",
+        "prerouting",
+        PREROUTING_PRIORITY - 10,
+        None,
+    )
+}
+
 pub(crate) fn public_rules(public: &PublicState) -> Value
 {
     let mut commands = inet_declarations();
+    // Connection cleanup runs with this guard installed. Release it atomically
+    // with the desired NAT and ownership rules, never between the two updates.
+    commands.extend(public_retirement_chain());
     commands.push(flush_chain(INET, PUBLIC_FORWARD_CHAIN));
     for (name, kind, hook, priority) in [
         (PUBLIC_INGRESS_CHAIN, "filter", "prerouting", -150),
@@ -994,6 +1049,53 @@ mod tests
             "add": {"element": {"family": "inet", "table": "quarry", "name": "from_instance",
                 "elem": [[names.host_veth, {"goto": {"target": forward}}]]}}
         })));
+    }
+
+    #[test]
+    fn a_world_change_retires_old_membership_in_the_forwarding_transaction()
+    {
+        let spec = spec("moving", "new", 5, AttachMode::Veth);
+        let retired = WorldMembership {
+            set_name: world_set_name("old", "moving"),
+            guest_ip: spec.guest_ip,
+            remove_set: false,
+        };
+        let value = instance_rules_with_retirements(&spec, std::slice::from_ref(&retired));
+        let forward = forward_chain(&InterfaceNames::for_instance("moving"));
+        let replace = position(&value, |command| command["flush"]["chain"]["name"] == forward);
+        let revoke = position(&value, |command| {
+            command["delete"]["element"]["name"] == retired.set_name
+                && command["delete"]["element"]["elem"] == json!(["10.0.0.5"])
+        });
+        assert!(replace < revoke);
+        assert!(!commands(&value).iter().any(|command| {
+            command["delete"]["set"]["name"] == retired.set_name
+        }));
+    }
+
+    #[test]
+    fn public_retirement_blocks_new_nat_flows_until_rules_are_replaced()
+    {
+        let mut public = PublicState::default();
+        public.retired_bindings.insert(crate::public::RetiredBinding {
+            address: Ipv4Addr::new(203, 0, 113, 9),
+            guest_ip: Ipv4Addr::new(10, 0, 0, 5),
+        });
+        let guard = public_retirement_guard(&public);
+        let chain = &commands(&guard)[1]["add"]["chain"];
+        assert_eq!(chain["hook"], "prerouting");
+        assert!(chain["prio"].as_i64().unwrap() < -200, "must precede conntrack");
+        assert_eq!(
+            rules(&guard, INET, PUBLIC_RETIREMENT_CHAIN),
+            vec![
+                vec![compare("==", ip_field("daddr"), json!("203.0.113.9")), drop()],
+                vec![compare("==", ip_field("saddr"), json!("10.0.0.5")), drop()],
+            ]
+        );
+        let desired = public_rules(&public);
+        assert!(commands(&desired).contains(&flush_chain(INET, PUBLIC_RETIREMENT_CHAIN)));
+        assert!(rules(&desired, INET, PUBLIC_RETIREMENT_CHAIN).is_empty());
+        assert!(commands(&desired).contains(&flush_chain(INET, PUBLIC_DNAT_CHAIN)));
     }
 
     #[test]

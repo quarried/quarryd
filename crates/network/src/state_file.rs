@@ -61,7 +61,14 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], mode: u32) -> Result<(
         .and_then(|()| file.write_all(bytes))
         .and_then(|()| file.sync_all())
         .map_err(|e| NetworkError::io(context("writing"), e))?;
-    fs::rename(&temporary, path).map_err(|e| NetworkError::io(context("replacing"), e))
+    fs::rename(&temporary, path).map_err(|e| NetworkError::io(context("replacing"), e))?;
+    if let Some(parent) = path.parent()
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| NetworkError::io(context("syncing the directory of"), e))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

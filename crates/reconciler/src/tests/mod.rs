@@ -9,6 +9,7 @@ mod flow;
 mod leases;
 mod recovery;
 mod snapshot;
+mod volume_ownership;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -31,6 +32,7 @@ use store::Store;
 use usage::Metrics;
 use volume::{FileVolume, ImageCache, SnapshotStore, Volumes};
 
+use crate::admission::volume_name;
 use crate::{Reconciler, ReconcilerConfig, ReconcilerEvent, ReconcilerHandle, ReconcilerParts};
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -193,7 +195,11 @@ impl Fixture
 
     pub async fn start(&self) -> Node
     {
-        let sandbox = Arc::new(self.sandbox());
+        self.start_with_sandbox(Arc::new(self.sandbox())).await
+    }
+
+    pub async fn start_with_sandbox(&self, sandbox: Arc<FakeSandbox>) -> Node
+    {
         let network = Arc::new(FakeNetwork::new(Some(self.path("network.json"))).unwrap());
         let volumes = Arc::new(Volumes::new(Arc::new(FileVolume::new(
             self.path("volumes"),

@@ -1,6 +1,6 @@
 - 4.6 | Valid volume names? | 1–127 chars of [A-Za-z0-9+_.-], not starting with '-' or '.' | Matches LVM naming and blocks path traversal in the file-backed fake.
 - 4.6 | create on an existing volume with a different size? | Return the existing volume unchanged | Creation is idempotent; resizing is not a spec feature.
-- 4.6 | LVM create interrupted between lvcreate and mkfs? | LV tagged quarry_mkfs_pending until mkfs.ext4 -q -F succeeds; a rerun formats again | Otherwise an interrupted create would return a volume without a filesystem.
+- 4.6 | LVM create interrupted between lvcreate and mkfs? | New LVs retain quarry_mkfs_pending_v2 until formatting and tag removal succeed; existing volumes always run activation/recovery; legacy pending ext4 is preserved, all-zero legacy volumes may be formatted, other legacy contents fail closed | Never return an unfinished LV, and never erase data exposed by an older daemon; inherited per-volume locks serialize orphan formatters and recovery.
 - 4.6 | How are thin snapshots exposed? | lvcreate --snapshot --setactivationskip n --activate y --permission r; existing ones are re-activated read-only | Keeps snapshot idempotent across reboots and partial runs.
 - 4.6 | Which LVs does quarryd see? | Only thin LVs in the configured pool (snapshots included) | quarryd manages only its own pool.
 - 4.6 | File-backed fake layout? | <dir>/<name>.img sparse files written via a partial file and renamed; snapshots are read-only copies | Atomic creation so an interrupted create is never mistaken for a finished one.
@@ -13,7 +13,7 @@
 - 4.6 | Restore validation? | Manifest layout and format version checked before download; each chunk hash and the whole-image sha256 verified after | Fails fast on corrupt manifests and catches non-blank targets.
 - 4.10 | SQLite durability settings? | WAL, synchronous=FULL, busy_timeout 5 s, migrations tracked in PRAGMA user_version | Operation and billing rows must survive power loss; the write rate is tiny.
 - 4.10 | u64 values in SQLite? | Values above i64::MAX are rejected | SQLite integers are signed.
-- 4.2 | Put with the same generation but different bytes? | Treated as an update | The control plane is authoritative.
+- 4.2 | Put with the same generation but different bytes? | Treat semantic content changes as updates; key admission and applied runtime state by content as well as generation | Supported updates cannot reuse admission for different resources or delete a disk still attached to the old runtime.
 - 4.2 | Put for an instance marked for deletion? | Ignored unless its generation is higher | A replayed Put must not resurrect a deleted instance.
 - 10 | How are unique instance UIDs allocated? | uid_allocations table with a UNIQUE uid, lowest free in [base, base+count), released when the instance is removed | Guarantees no two instances share a UID.
 - 4.3 | finish_operation called twice? | First result wins | Replayed operations must return one stable result.
@@ -35,7 +35,7 @@
 - 6 | How is a deleted instance reported? | InstanceStatus with PHASE_DELETED after cleanup; PHASE_REJECTED when admission refuses a spec | The state diagram ends at [*] and admission rejection has no phase.
 - 10 | How does a node get its first certificate? | Enroll RPC: join token + CSR over server-authenticated TLS; rotation calls Enroll with the current client certificate and no token | Section 10 requires join token → CSR → certificate but the sketch has no RPC for it.
 - 4.8 | Guest-proto encoding? | Hand-derived prost messages with a 4-byte big-endian length prefix | Shared by host and guest with no build step.
-- 4.6 | Guest acknowledgement for world-consistent backups? | Added SnapshotPrepared (guest → host) and ResumeWrites (host → guest) | save-all flush → freeze → snapshot → resume needs an ack and a resume step.
+- 4.6 | Guest acknowledgement for world-consistent backups? | PrepareSnapshot, SnapshotPrepared, and ResumeWrites carry a unique request_id; an acknowledgement must match the current request and connection | Old, missing, or delayed acknowledgements cannot authorize a new snapshot; stale resumes cannot release a later freeze.
 - 10 | How do secrets reach the jail? | Sent in the guest Configure message and written by the guest agent to a tmpfs at /run/quarry/secrets; Debug output prints names only | Works identically for Firecracker and gVisor and never touches host disk or logs.
 - 4.8 | Frame size limits? | Guest → host 16 KiB; host → guest 1 MiB | Configure carries env and secrets; guest input is untrusted and kept small.
 - 4.8 | Host-message limits? | instance_id ≤ 128 bytes; env names ≤ 256 bytes without '='; env values ≤ 32 KiB; server_command ≤ 256 args of ≤ 4096 bytes; console command ≤ 1024 bytes without control characters; Shutdown deadline ≤ 1 h | Bounded, validated input on both sides.
@@ -49,7 +49,7 @@
 - 4.5 | When does eviction run? | After a download that pushes the cache over capacity, skipping artifacts being downloaded or referenced | LRU over unreferenced artifacts only, as 4.5 requires.
 - 4.5 | Order of reference and fetch? | The supervisor acquires the instance's reference before ensure | Eviction can never remove an artifact between download and boot.
 - 3 | Does the Sandbox trait need more than the five spec methods? | Added guest_socket_path, status and destroy | The supervisor needs crash detection, cleanup, and a guest listener bound before launch.
-- 11 | How are cpu.max and pinning applied to Firecracker? | Unit CPUQuotaPerSecUSec = vCPUs × 1 s and AllowedCPUs, plus per-vCPU-thread sched_setaffinity; no jailer --cgroup arguments | Jailer cgroup arguments move Firecracker out of the unit's cgroup, breaking KillUnit, adoption, and usage sampling.
+- 11 | How are cpu.max and pinning applied to Firecracker? | Unit CPUQuotaPerSecUSec = vCPUs × 1 s and AllowedCPUs, plus per-vCPU-thread sched_setaffinity; no jailer --cgroup arguments; IOAccounting is enabled on creation and adoption | Unit cgroups remain authoritative for killing and billing running sandboxes.
 - 11 | Memory limit for Firecracker units? | No MemoryMax; memory is controlled by the VM size and the balloon | An exact cap would OOM-kill the VMM because of its own overhead.
 - 11 | Meaning of set_memory_target on Firecracker? | Guest-visible memory: balloon size = configured mem_size_mib − target | Matches "memory can be adjusted with the balloon".
 - 4.4 | How is the VMM exit code and console captured? | Unit runs /bin/sh: a FIFO feeds `quarryd console-ring` (ignoring TERM), the VMM execs as MainPID, and ExecStopPost writes $EXIT_CODE/$EXIT_STATUS to <runtime_dir>/exit_status | The console survives quarryd restarts and status works after systemd garbage-collects the transient unit.
@@ -60,7 +60,7 @@
 - 9 | launch on an already active unit? | Returns the persisted record; a VM configured but never started is started | quarryd may crash mid-launch.
 - 10 | Instance ID format? | 1–64 characters of [A-Za-z0-9-] | The jailer's --id accepts nothing else.
 - 10 | Jail layout? | <chroot_base>/firecracker/<id>/root with run/v.sock (guest vsock uds, so the host listens on run/v.sock_5252) and run/firecracker.socket; kernel and rootfs hard-linked or copied; data device re-created with mknod; guest socket chowned to the instance uid | Jailer requirements with an unprivileged VMM.
-- 3 | gVisor runtime details? | runsc --platform=systrap --network=sandbox --host-uds=open; read-only root with tmpfs /run and /tmp; all capabilities dropped; rootfs loop-mounted and data mounted by the unit's start script and unmounted by ExecStopPost | The bind-mounted guest socket needs host-uds; mounts live with the unit, not quarryd.
+- 3 | gVisor runtime details? | runsc --platform=systrap --network=sandbox --host-uds=open --ignore-cgroups; unit-owned read-only root and writable data mounts, no guest capabilities, dedicated guest socket directory bind mount, and no-follow ownership repair while stopped | Accounting stays in the unit cgroup, listener replacement remains visible, and allocated guest UIDs can use restored data.
 - 4.7 | Is the :25565 edge proxy part of quarryd? | No; quarryd only allows host → instance traffic on declared ports and routes to the private IP | Section 1: quarryd accepts no inbound internet connections.
 - 4.7 | Topology? | Per-instance netns quarry-<hash> bind-mounted under /var/run/netns, veth pair to the host with a /32 route and proxy ARP; Firecracker adds a persistent TAP inside the netns; gateway /32 on dummy link quarry0 | Routed mode isolates tenants at L3 and the netns serves both the jailer and runsc.
 - 4.7 | Protocol of declared ports? | TCP and UDP | Ports carry no protocol; Bedrock and voice plugins use UDP.
@@ -73,7 +73,7 @@
 - 4.7 | When is WireGuard configured? | Only when a listen port, address, or peers are given; keepalive 25 s; a route per allowed IP; /0 and subnet-overlapping allowed IPs rejected | Nodes may be behind NAT and peers must not hijack host routes.
 - 4.7 | WireGuard key lifecycle? | Generated lazily, stored at state_dir/wireguard.key (0600), reported in Hello | Hello needs the key before NetworkConfig arrives.
 - 4.7 | Subnet validation? | Host bits must be clear and the prefix must be /1–/30; changes are refused while instances are attached | Catches control-plane mistakes and keeps addresses valid.
-- 9 | Network state across restarts? | state_dir/network-state.json records node config and attachments, written before changes | attach and detach work after a restart before the control plane reconnects.
+- 9 | Network state across restarts? | Persist node config, attachments and pending retirements before side effects, sync atomic state-file renames, and replay cleanup before releasing retired ownership | Interrupted world/public-address changes retain enough information to revoke old access.
 - 10 | Interface name collisions? | Names derive from a 40-bit FNV-1a hash of the instance id; a colliding attach is refused | IFNAMSIZ limits names to 15 characters.
 - 4.8 | Guest reconnect policy? | Retry forever, 100 ms doubling to 2 s; Ready re-sent on every reconnect | Adoption needs the guest to find the re-created host listener without restarting the server.
 - 4.8 | Configure for a different generation while running? | Ignored; generation changes are host-side restarts | Configure is idempotent.
@@ -84,7 +84,7 @@
 - 4.8 | Quarry config on an empty data disk? | With the default command, write /data/quarry.toml (listen 0.0.0.0, port QUARRY_PORT or 25565, world_path /data/world) when absent, atomically; an existing file is left alone | Quarry refuses to start without world_path; images may ship their own config.
 - 4.8 | World on an empty data disk? | When quarry.toml points at /data/world and level.dat is missing, run `quarry-server pregenerate --side 1` with seed QUARRY_WORLD_SEED or the instance ID, 5 min timeout, failure fails the start | Quarry only opens existing worlds; one chunk takes under a second and the rest generates on demand.
 - 6 | Escalation inside the guest on Shutdown? | `stop` on the console, SIGINT at 80 % of the deadline, SIGKILL at the deadline | Quarry saves on `stop` and on SIGINT but not on SIGTERM.
-- 4.6 | Guest freeze? | save-off → save-all flush → wait for "Saved the game" (30 s) → sync → FIFREEZE /data only when it is its own filesystem (unsupported filesystems skip); writes resume after 60 s at the latest | Never freezes the root fs and never stays frozen if the host disappears.
+- 4.6 | Guest freeze? | save-off → save-all flush → wait for "Saved the game" (30 s) → sync → FIFREEZE /data only when it is its own filesystem (unsupported filesystems skip); auto-resume after 60 s, and cancel/resume on host disconnect | A new request cannot reuse an existing freeze; cancelled saves drain their completion before another snapshot starts, and cancelled freezes never acknowledge success.
 - 6 | Unrequested server exit? | Guest agent exits non-zero after draining output | The host applies the restart policy to crashes.
 - 6 | Guest exit code after SIGKILL at the deadline? | 128 + signal | Shell convention.
 - 10 | Secrets location? | tmpfs /run/quarry/secrets (0700, files 0400) when PID 1; otherwise /run/quarry/secrets, $XDG_RUNTIME_DIR, or a temp dir; QUARRY_SECRETS_DIR passed to the server | Values never logged or written to persistent disk inside the VM.
@@ -95,12 +95,12 @@
 - 6 | Delete before admission? | Pending → Deleting | Nothing has been provisioned that needs stopping.
 - 6 | Re-put while Deleting? | Deletion finishes, then the row is recreated as Pending | The newer desired state is not lost.
 - 6 | New generation of a running instance rejected? | Graceful stop, then Stopped → Rejected | Resources may not be held without admission.
-- 6 | Stop, new generation, or lease loss during Booting/Starting? | Wait until Running or Failed; delete goes via Failed → Deleting | The diagram has no Booting/Starting → Stopping edge.
-- 6 | Where is a new generation prepared? | In Stopped or Failed, idempotently, before Booting | The diagram has no Stopped → Preparing edge but specs change between generations.
+- 6 | Stop, new generation, or lease loss during Booting/Starting? | Revoke controlled launches before workload activation; a running boot follows mandatory shutdown and cleanup; backend-layout migration may enter Stopping from Booting/Starting | Lease authority and verified ownership take precedence over readiness or network convergence.
+- 6 | Where is a new generation prepared? | In Stopped or Failed, idempotently, before Booting; recheck current content admission, run state, lease and required secrets before and throughout backend launch | Slow downloads, restore or backend setup must not start a stale writer.
 - 6 | Failed instance whose desired state is stopped? | Stays Failed | There is no Failed → Stopped edge.
 - 4.4 | Unspecified restart policy? | on-failure | Safe default.
 - 4.4 | Restart policy details? | always restarts immediately; on-failure backs off exponentially and skips clean exit 0; the restart count resets after Running for restart_backoff_max or on a new generation | Section 4.4 names backoff only for on-failure.
-- 8 | When does spec.lease apply? | Only when the put inserts or updates the stored spec | A replayed put must not refresh an expired lease.
+- 8 | When does spec.lease apply? | Only for genuine semantic spec changes; desired spec and lease deadline commit together, and protobuf map order does not constitute a change | Replays neither refresh an expired lease nor leave partially applied grants.
 - 8 | Lease grant with ttl 0 or a lower epoch? | ttl 0 uses the configured default; lower epochs are ignored; wall-clock expiry is persisted | Section 8 and the configurable TTL.
 - 4.2 | Put with an invalid instance id? | Rejected status only, no row | The id cannot safely name a row, volume, or socket.
 - 4.2 | Delete of an unknown id? | Report Deleted with reason "unknown instance" | The control plane converges.
@@ -108,13 +108,13 @@
 - 11 | What is "new" while draining? | Pending or Rejected instances; new generations of existing instances are still admitted | Drain stops placement, not updates.
 - 10 | Where are secret values kept on the node? | Only in memory; the stored spec keeps names with empty values; after a restart a boot waits for the control plane to re-send the spec | Secrets never touch the host disk.
 - 4.8 | Is Configure re-sent on guest reconnect? | Only while Booting; in Starting/Running a re-sent Ready is accepted | Configure is per boot.
-- 4.8 | Guest abuse handling? | Oversized frame, invalid frame, or rate limit exceeded drops that guest's connection and increments an abuse counter in diagnostics | Isolation between instances.
+- 4.8 | Guest abuse handling? | Invalid/oversized frames and exhausted budgets drop the connection and increment diagnostics; the configured shared bucket and a bounded control-message reserve survive reconnects; connection acceptance is separately paced | Reconnection cannot replenish a hostile guest's allowance, and permitted logging cannot starve control traffic.
 - 4.8 | Guest connections per instance? | One; a new connection replaces the old | The guest agent reconnects after restarts.
 - 4.8 | Missing health reports? | After 30 s a warning in the status reason, no restart | Restart policy covers crashes only.
-- 9 | Unadoptable instance after restart? | Failed with "not adoptable after restart" (plus "waiting for lease" if expired); Stopping becomes Stopped; stray sandboxes in idle phases are destroyed | Section 9.
-- 4.6 | Volume naming and disks? | <id>-<disk> sanitized to [A-Za-z0-9+_.-], at most 100 chars; exactly one data disk required | The sandbox has one data drive.
+- 9 | Unadoptable instance after restart? | Distinguish confirmed absence from uncertain adoption; preserve identity and retry uncertainty, or confirm cleanup before clearing ownership; discover deterministic backend identity when SQLite lacks a record | Live sandboxes remain subject to stop/delete and lease enforcement.
+- 4.6 | Volume naming and disks? | New names use a domain-separated SHA-256 of instance ID and disk name; SQLite binds each logical disk to one exclusively owned physical volume; preserve unambiguous legacy names and quarantine conflicting claims; exactly one data disk | Prevents cross-instance aliases without renaming or discarding existing worlds.
 - 4.6 | Crash-safe restore? | kv markers reconciler/restore/<volume> (pending → done); a pending restore is redone | A half-restored volume is never booted.
-- 4.6 | Local snapshot handling? | Named <volume>-snap-<unix>, deleted after upload; SnapshotPrepared timeout 60 s; ResumeWrites always sent | World writes always resume.
+- 4.6 | Local snapshot handling? | Unique names per request; deleted after upload; one 55 s host deadline covers send, preparation, and snapshot creation; matching ResumeWrites always attempted | Late results are refused and cleaned up before they can be published as world-consistent snapshots.
 - 4.4 | Instance files on delete? | state_dir/<id> including the console ring is removed | Delete leaves nothing behind.
 - 11 | CPU pinning assignment? | Slot = uid − uid_base over CPUs [reservation.vcpus, capacity.vcpus) | Deterministic and keeps host-reserved CPUs free.
 - 11 | Balloon idle reclaim amount? | Half of memory_mib; unsupported backends log once | Opt-in low-tier reclaim.
@@ -133,7 +133,7 @@
 - 4.3 | StreamLogs? | Reads the console ring and uploads it through the StreamLogs RPC; follow mode polls every 500 ms until the control plane closes the stream or the instance is gone | Large data uses separate RPCs per section 4.1.
 - 10 | Certificate rotation? | Checked every 10 minutes; re-enroll with the current certificate when less than 8 h of the 24 h validity remains, then reconnect | Section 10: short-lived, auto-rotated certificates.
 - 10 | TLS settings? | rustls with TLS 1.3 only, the pinned CA as the only root, ALPN h2, ring crypto provider | Section 10: mTLS only, pinned CA, TLS 1.3.
-- 10 | Key storage? | node.key written 0600 via atomic rename under state_dir/identity | Private key protection.
+- 10 | Key storage? | Complete certificate/key/expiry generations in 0600 identity.json, atomically renamed and directory-synced, with a durable validated identity.previous.json fallback; legacy files remain readable | Rotation cannot publish a mismatched key/certificate pair.
 - 9 | Self-update mechanics? | Download through the ImageCache (digest and minisign verified), keep the old binary as <binary>.prev, write update-pending.json, swap atomically, start transient unit quarryd-rollback.service running `<prev> rollback --delay-secs N`, then exit; the new binary removes the marker and stops the watchdog after its first successful connection | Section 9: verified atomic swap with watchdog rollback after N minutes.
 - 9 | Rollback window? | update.rollback_after_secs, default 600 | Section 9 leaves N open.
 - 9 | Does stopping quarryd stop instances? | No; SIGTERM stops quarryd's tasks only | Section 9.
@@ -151,10 +151,14 @@
 - 1.1 | Player identity and operator source? | Probe list uuids, supplement with usercache/ops files and join/leave logs, never fabricate UUIDs | Authenticated player actions need the actual server identity.
 - 1.1 | MSPT percentiles when a server exposes no histogram? | Compute p50/p99 over the last 60 observed tick-duration samples; Quarry uses its reported last tick | Guest health is display-only and the server protocols expose different statistics.
 - 1.3 | Multiple data disks? | Retain the existing one-data-disk admission limit and replace that disk by name | Both sandbox backends expose one writable data drive and the coordinator provisions one world disk.
-- 1.3 | Durable retired-disk tracking? | SQLite instance_disks records volume names before spec replacement; serialize cleanup against new puts and remove only names absent from the current Running generation | A crash or concurrent desired-state update must not leak disks or delete a current disk.
+- 1.3 | Durable retired-disk tracking? | SQLite records exclusive logical-to-physical bindings and the applied runtime spec atomically with actual state; cleanup removes only owned disks absent from that applied spec after the replacement runs | Same-generation updates and restarts cannot delete a still-attached disk.
 - 2.6 | Silent log upload cancellation? | Send an initial empty chunk and check upload completion every 500 ms even when no new console bytes arrive | Closing the HTTP viewer must terminate the agent's follow operation.
 - Part 3 | Public IP reattachment mode? | Reattaching the same address preserves mode; replacing an address begins in Starting | Idempotent reconciliation must not interrupt a running server, and a new binding must fail closed until readiness.
 - Part 3 | Responder listener ports and recovery? | Allocate per-instance ephemeral local ports, persist them with bindings, reuse them after restart or persist a new port when unavailable | Each redirected connection remains attributable to exactly one public address.
 - Part 3 | Direct access to responder listener ports? | Fake listeners bind localhost; real listeners bind for REDIRECT with nftables guards allowing only the public address's redirected TCP 25565 traffic | Prevents bypassing public-address ownership through local responder ports.
 - 1.1 | Online-since time for players already present when the guest starts? | Use the first observed join time | Server probes do not expose historical join timestamps.
 - Part 3 | An initially stopped spec with a public address? | Prepare its disk and network and start the sleep responder without launching the sandbox | A stopped instance must own and answer on its public address before its first start.
+- Part 3 | Conntrack across public address, guest address, or running/responder routing changes? | Persist retired address/guest pairs, block their traffic before conntrack, delete IPv4 original-destination and reply-destination matches with conntrack-tools, then install the new rules and durably clear retirement | Existing DNAT and SNAT mappings must not survive ownership changes; failed cleanup keeps the address reserved and retries after restart.
+- 9 | Legacy instances without an applied-spec record? | Adopt and preserve the existing process with conservative resource reservations and a separate desired baseline; skip retired-disk cleanup and refuse snapshots until a confirmed new launch records actual content | Avoid guessing attached disks or restarting every legacy VM during a daemon upgrade.
+- 9 | Legacy gVisor socket-file mounts? | Perform a controlled replacement to install the directory mount, including for restart policy Never when desired run authority is valid | An already mounted socket inode cannot follow a new host listener.
+- 6 | Public-network errors during shutdown? | Retry network convergence independently while enforcing stop and lease deadlines | A broken firewall command must never keep an expired writer alive.

@@ -310,10 +310,9 @@ async fn replacement_cleanup_survives_a_crash_after_the_new_disk_is_running()
     });
     node.handle.put_instance(spec.clone()).await.unwrap();
     wait_for_crash(id, "PHASE_RUNNING").await;
-    assert_eq!(
-        fixture.store.instance_disks(id).unwrap(),
-        vec![format!("{id}-data"), format!("{id}-restored")]
-    );
+    let mut expected_disks = vec![volume_name(id, "data"), volume_name(id, "restored")];
+    expected_disks.sort();
+    assert_eq!(fixture.store.instance_disks(id).unwrap(), expected_disks);
     assert_eq!(fixture.volume_files().len(), 2);
     node.stop().await;
     let node = fixture.start().await;
@@ -324,8 +323,9 @@ async fn replacement_cleanup_survives_a_crash_after_the_new_disk_is_running()
         assert!(tokio::time::Instant::now() < until);
         sleep_ms(10).await;
     }
-    assert_eq!(fixture.volume_files(), vec![format!("{id}-restored.img")]);
-    let restored = fixture.path(&format!("volumes/{id}-restored.img"));
+    let restored_name = volume_name(id, "restored");
+    assert_eq!(fixture.volume_files(), vec![format!("{restored_name}.img")]);
+    let restored = fixture.path(&format!("volumes/{restored_name}.img"));
     assert_eq!(
         std::fs::read(&restored).unwrap(),
         b"snapshot world contents"
@@ -335,9 +335,288 @@ async fn replacement_cleanup_survives_a_crash_after_the_new_disk_is_running()
     node.handle.put_instance(spec).await.unwrap();
     node.wait_running(id, 3).await;
     assert_eq!(std::fs::read(&restored).unwrap(), b"new live world changes");
-    assert_eq!(fixture.volume_files(), vec![format!("{id}-restored.img")]);
+    assert_eq!(fixture.volume_files(), vec![format!("{restored_name}.img")]);
     node.handle.delete_instance(id).await.unwrap();
     node.wait_gone(id, &fixture.store).await;
     assert!(fixture.store.instance_disks(id).unwrap().is_empty());
+    node.stop().await;
+}
+
+async fn interrupted_preparation_rechecks_lease_and_secrets(id: &str, checkpoint: &str)
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let mut spec = fixture.spec(id, "normal");
+    spec.secrets
+        .insert("password".to_owned(), b"in-memory-secret".to_vec());
+    crash::arm(id, checkpoint);
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    wait_for_crash(id, checkpoint).await;
+    node.stop().await;
+    assert_eq!(fixture.starts(id), 0);
+    let mut actual = fixture.store.get_instance(id).unwrap().unwrap().actual();
+    actual.lease_expires_unix_ms = Some(crate::leases::unix_ms_now() - 1000);
+    fixture.store.update_actual(id, &actual).unwrap();
+
+    let node = fixture.start().await;
+    sleep_ms(700).await;
+    assert_eq!(
+        fixture.starts(id),
+        0,
+        "recovery launched with an expired lease"
+    );
+    assert!(
+        !fixture
+            .trace(id)
+            .iter()
+            .any(|line| line.starts_with("configure "))
+    );
+    node.handle
+        .grant_lease(proto::v1::LeaseGrant {
+            instance_id: id.to_owned(),
+            epoch: 1,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+    sleep_ms(700).await;
+    assert_eq!(
+        fixture.starts(id),
+        0,
+        "recovery launched before secrets were retransmitted"
+    );
+    node.handle.put_instance(spec).await.unwrap();
+    node.wait_running(id, 1).await;
+    assert_eq!(fixture.starts(id), 1);
+    assert!(
+        fixture
+            .trace(id)
+            .iter()
+            .any(|line| line.contains("password=in-memory-secret"))
+    );
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preparing_recovery_waits_for_a_current_lease_and_retransmitted_secrets()
+{
+    interrupted_preparation_rechecks_lease_and_secrets("rec-prepare-gates", "after-volume").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn booting_recovery_waits_for_a_current_lease_and_retransmitted_secrets()
+{
+    interrupted_preparation_rechecks_lease_and_secrets("rec-boot-gates", "PHASE_BOOTING").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deletion_recovers_and_kills_a_live_sandbox_missing_its_database_record()
+{
+    let mut fixture = Fixture::new().await;
+    fixture.stop_deadline = Duration::from_millis(400);
+    fixture.kill_deadline = Duration::from_millis(400);
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "rec-orphan-delete";
+    node.handle
+        .put_instance(fixture.spec(id, "ignore-shutdown"))
+        .await
+        .unwrap();
+    node.wait_running(id, 1).await;
+    let pid = fixture.last_pid(id).unwrap();
+    node.stop().await;
+    assert!(process_alive(pid));
+
+    // Model a crash after the backend started the unit but before SQLite
+    // recorded its handle. Backend identity files still identify the process.
+    let mut actual = fixture.store.get_instance(id).unwrap().unwrap().actual();
+    actual.phase = "PHASE_BOOTING".to_owned();
+    actual.observed_generation = 0;
+    actual.sandbox_record = None;
+    actual.pid = None;
+    actual.unit_name = None;
+    actual.api_socket = None;
+    fixture.store.update_actual(id, &actual).unwrap();
+    fixture.store.mark_deleted_desired(id).unwrap();
+
+    let node = fixture.start().await;
+    node.wait_gone(id, &fixture.store).await;
+    assert!(
+        !process_alive(pid),
+        "deletion released resources around a still-live orphan"
+    );
+    assert_eq!(fixture.starts(id), 1);
+    assert!(fixture.volume_files().is_empty());
+    assert!(node.network.attachments().is_empty());
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncertain_sandbox_recovery_preserves_identity_until_delete_stops_it()
+{
+    let mut fixture = Fixture::new().await;
+    fixture.stop_deadline = Duration::from_millis(400);
+    fixture.kill_deadline = Duration::from_millis(400);
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "rec-uncertain-delete";
+    node.handle
+        .put_instance(fixture.spec(id, "ignore-shutdown"))
+        .await
+        .unwrap();
+    node.wait_running(id, 1).await;
+    let pid = fixture.last_pid(id).unwrap();
+    let original_row = fixture.store.get_instance(id).unwrap().unwrap();
+    let recorded_pid = original_row.pid;
+    let original = original_row.sandbox_record;
+    assert!(original.is_some());
+    node.stop().await;
+
+    let sandbox = Arc::new(fixture.sandbox());
+    sandbox.fail_next_recover();
+    let node = fixture.start_with_sandbox(sandbox).await;
+    assert!(process_alive(pid));
+    let row = fixture.store.get_instance(id).unwrap().unwrap();
+    assert_eq!(
+        row.sandbox_record, original,
+        "an uncertain backend must not erase the cleanup handle"
+    );
+    assert_eq!(row.pid, recorded_pid);
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    assert!(!process_alive(pid));
+    assert_eq!(
+        fixture.starts(id),
+        1,
+        "recovery must not launch another process"
+    );
+    assert!(fixture.volume_files().is_empty());
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adoption_error_does_not_abandon_the_original_process()
+{
+    let mut fixture = Fixture::new().await;
+    fixture.stop_deadline = Duration::from_millis(400);
+    fixture.kill_deadline = Duration::from_millis(400);
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "rec-adopt-error";
+    node.handle
+        .put_instance(fixture.spec(id, "ignore-shutdown"))
+        .await
+        .unwrap();
+    node.wait_running(id, 1).await;
+    let pid = fixture.last_pid(id).unwrap();
+    node.stop().await;
+
+    let sandbox = Arc::new(fixture.sandbox());
+    sandbox.fail_next_adopt();
+    let node = fixture.start_with_sandbox(sandbox).await;
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    assert!(
+        !process_alive(pid),
+        "a readiness/adoption error left the original sandbox alive"
+    );
+    assert_eq!(fixture.starts(id), 1);
+    assert!(fixture.volume_files().is_empty());
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_unknown_applied_spec_adopts_unchanged_pid_and_restarts_on_a_later_edit()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "rec-legacy-applied";
+    let mut spec = fixture.spec(id, "normal");
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    node.wait_running(id, 1).await;
+    let original_pid = fixture.last_pid(id).unwrap();
+    node.stop().await;
+
+    // Rows predating the applied_spec migration must remain adoptable even
+    // though the daemon cannot reconstruct their exact historical spec.
+    let mut actual = fixture.store.get_instance(id).unwrap().unwrap().actual();
+    actual.applied_spec = None;
+    fixture.store.update_actual(id, &actual).unwrap();
+    let node = fixture.start().await;
+    node.wait_running(id, 1).await;
+    fixture.wait_trace(id, "ready again").await;
+    sleep_ms(700).await;
+    assert!(process_alive(original_pid));
+    assert_eq!(fixture.last_pid(id), Some(original_pid));
+    assert_eq!(fixture.starts(id), 1);
+
+    spec.memory_mib = 1024;
+    node.handle.put_instance(spec).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while fixture.starts(id) < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            node.history(id)
+        );
+        sleep_ms(20).await;
+    }
+    node.wait_running(id, 1).await;
+    assert!(!process_alive(original_pid));
+    assert!(
+        fixture
+            .store
+            .get_instance(id)
+            .unwrap()
+            .unwrap()
+            .applied_spec
+            .is_some()
+    );
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conclusive_sandbox_absence_clears_the_persisted_cleanup_identity()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "rec-confirmed-absent";
+    node.handle
+        .put_instance(fixture.spec(id, "normal"))
+        .await
+        .unwrap();
+    node.wait_running(id, 1).await;
+    let pid = fixture.last_pid(id).unwrap();
+    node.stop().await;
+    kill_process(pid);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while process_alive(pid)
+    {
+        assert!(tokio::time::Instant::now() < deadline);
+        sleep_ms(20).await;
+    }
+    sleep_ms(200).await;
+
+    let node = fixture.start().await;
+    node.wait_phase(id, Phase::Failed).await;
+    let row = fixture.store.get_instance(id).unwrap().unwrap();
+    assert!(
+        row.sandbox_record.is_none(),
+        "confirmed absence retained a stale cleanup record"
+    );
+    assert!(row.pid.is_none());
+    assert!(row.unit_name.is_none());
+    assert!(row.api_socket.is_none());
+    assert_eq!(fixture.starts(id), 1);
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
     node.stop().await;
 }

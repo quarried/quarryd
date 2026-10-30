@@ -12,6 +12,8 @@ pub(crate) struct PublicState
     pub bindings: BTreeMap<String, PublicBinding>,
     #[serde(default)]
     pub retired_proxies: BTreeSet<ProxyNeighbour>,
+    #[serde(default)]
+    pub retired_bindings: BTreeSet<RetiredBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +30,24 @@ pub(crate) struct ProxyNeighbour
 {
     pub interface: String,
     pub address: Ipv4Addr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct RetiredBinding
+{
+    pub address: Ipv4Addr,
+    pub guest_ip: Ipv4Addr,
+}
+
+impl From<&PublicBinding> for RetiredBinding
+{
+    fn from(binding: &PublicBinding) -> Self
+    {
+        Self {
+            address: binding.address,
+            guest_ip: binding.guest_ip,
+        }
+    }
 }
 
 impl PublicState
@@ -82,6 +102,20 @@ impl PublicState
                 format!("public IPv4 address {address} is already bound to instance {owner}"),
             ));
         }
+        if self
+            .retired_bindings
+            .iter()
+            .any(|binding| binding.address == address)
+            && !self
+                .bindings
+                .get(instance_id)
+                .is_some_and(|binding| binding.address == address)
+        {
+            return Err(NetworkError::invalid_spec(
+                instance_id,
+                format!("public IPv4 address {address} is awaiting connection cleanup"),
+            ));
+        }
         Ok(())
     }
 
@@ -103,12 +137,39 @@ impl PublicState
     pub fn remove(&mut self, instance_id: &str)
     {
         if let Some(binding) = self.bindings.remove(instance_id)
-            && self.config.arp == PublicIpv4Arp::Proxy
         {
-            self.retired_proxies.insert(ProxyNeighbour {
-                interface: self.config.uplink_interface.clone(),
-                address: binding.address,
-            });
+            self.retired_bindings.insert(RetiredBinding::from(&binding));
+            if self.config.arp == PublicIpv4Arp::Proxy
+            {
+                self.retired_proxies.insert(ProxyNeighbour {
+                    interface: self.config.uplink_interface.clone(),
+                    address: binding.address,
+                });
+            }
+        }
+    }
+
+    pub fn update_guest_ip(&mut self, instance_id: &str, guest_ip: Ipv4Addr)
+    {
+        if let Some(binding) = self.bindings.get_mut(instance_id)
+            && binding.guest_ip != guest_ip
+        {
+            self.retired_bindings
+                .insert(RetiredBinding::from(&*binding));
+            binding.guest_ip = guest_ip;
+        }
+    }
+
+    pub fn set_mode(&mut self, instance_id: &str, mode: PublicIpMode)
+    {
+        if let Some(binding) = self.bindings.get_mut(instance_id)
+        {
+            if (binding.mode == PublicIpMode::Running) != (mode == PublicIpMode::Running)
+            {
+                self.retired_bindings
+                    .insert(RetiredBinding::from(&*binding));
+            }
+            binding.mode = mode;
         }
     }
 
@@ -120,10 +181,12 @@ impl PublicState
     ) -> Result<(), NetworkError>
     {
         self.validate(instance_id, &address.to_string())?;
-        if let Some(binding) = self.bindings.get_mut(instance_id)
-            && binding.address == address
+        if self
+            .bindings
+            .get(instance_id)
+            .is_some_and(|binding| binding.address == address)
         {
-            binding.guest_ip = guest_ip;
+            self.update_guest_ip(instance_id, guest_ip);
             return Ok(());
         }
         self.remove(instance_id);

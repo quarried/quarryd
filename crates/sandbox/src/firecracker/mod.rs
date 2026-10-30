@@ -15,9 +15,9 @@ use crate::shell::{console_script, path_text, writer_argv};
 use crate::unit::{self, EXIT_STATUS_FILE, blocking};
 use crate::unit_bus::{TransientServiceProperties, UnitBus};
 use crate::{
-    GUEST_AGENT_PATH, GUEST_VSOCK_PORT, Sandbox, SandboxError, SandboxHandle, SandboxKind,
+    GUEST_AGENT_PATH, GUEST_VSOCK_PORT, LaunchControl, Sandbox, SandboxError, SandboxHandle, SandboxKind,
     SandboxRecord, SandboxSpec, SandboxState, ShutdownMode, guest_environment, persist_record,
-    read_persisted_record, unit_name, validate_spec,
+    read_persisted_record, unit_name, validate_instance_id, validate_spec,
 };
 
 mod api;
@@ -40,6 +40,14 @@ const API_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const VCPU_THREAD_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const STOP_TIMEOUT_USEC: u64 = 30_000_000;
+
+async fn wait_for_cancellation(control: &LaunchControl)
+{
+    while !control.is_cancelled()
+    {
+        sleep(POLL_INTERVAL).await;
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirecrackerConfig
@@ -197,6 +205,7 @@ pub fn unit_properties(
         slice: config.slice.clone(),
         kill_mode: Some("control-group".to_string()),
         cpu_quota_per_sec_usec: Some(u64::from(spec.vcpus) * 1_000_000),
+        io_accounting: true,
         allowed_cpus: spec.cpu_pinning.clone(),
         exec_stop_post: vec![unit::exit_status_command(exit_file)?],
         timeout_stop_usec: Some(STOP_TIMEOUT_USEC),
@@ -451,13 +460,18 @@ impl Firecracker
         JailPaths::new(&self.config, instance_id)
     }
 
-    fn base_record(&self, spec: &SandboxSpec, paths: &JailPaths) -> SandboxRecord
+    fn base_record(
+        &self,
+        instance_id: &str,
+        generation: u64,
+        paths: &JailPaths,
+    ) -> SandboxRecord
     {
         SandboxRecord {
-            instance_id: spec.instance_id.clone(),
-            generation: spec.generation,
+            instance_id: instance_id.to_owned(),
+            generation,
             kind: SandboxKind::Firecracker,
-            unit_name: unit_name(&spec.instance_id),
+            unit_name: unit_name(instance_id),
             api_socket: Some(paths.api_socket.clone()),
             guest_socket: paths.guest_socket.clone(),
             console_path: paths.console.clone(),
@@ -480,12 +494,19 @@ impl Firecracker
         api: &FirecrackerApi,
         unit: &str,
         console: &Path,
+        control: &LaunchControl,
     ) -> Result<InstanceInfo, SandboxError>
     {
         let deadline = Instant::now() + API_READY_TIMEOUT;
         loop
         {
-            match api.instance_info().await
+            control.check()?;
+            let result = tokio::select! {
+                result = api.instance_info() => result,
+                () = wait_for_cancellation(control) => return Err(SandboxError::LaunchCancelled),
+            };
+            control.check()?;
+            match result
             {
                 Ok(info) => return Ok(info),
                 Err(error) if Instant::now() >= deadline =>
@@ -508,8 +529,10 @@ impl Firecracker
         &self,
         api: &FirecrackerApi,
         spec: &SandboxSpec,
+        control: &LaunchControl,
     ) -> Result<(), SandboxError>
     {
+        control.check()?;
         api.put_logger(&Logger {
             log_path: JAIL_LOG.to_string(),
             level: "Warning".to_string(),
@@ -517,16 +540,19 @@ impl Firecracker
             show_log_origin: false,
         })
         .await?;
+        control.check()?;
         api.put_metrics(&Metrics {
             metrics_path: JAIL_METRICS.to_string(),
         })
         .await?;
+        control.check()?;
         api.put_machine_config(&MachineConfig {
             vcpu_count: spec.vcpus,
             mem_size_mib: spec.memory_mib,
             smt: false,
         })
         .await?;
+        control.check()?;
         api.put_boot_source(&BootSource {
             kernel_image_path: JAIL_KERNEL.to_string(),
             boot_args: boot_args(spec)?,
@@ -534,8 +560,10 @@ impl Firecracker
         .await?;
         for drive in drives()
         {
+            control.check()?;
             api.put_drive(&drive).await?;
         }
+        control.check()?;
         if let Some(tap) = &spec.network.tap_name
         {
             api.put_network_interface(&NetworkInterface {
@@ -545,27 +573,39 @@ impl Firecracker
             })
             .await?;
         }
+        control.check()?;
         api.put_vsock(&Vsock {
             guest_cid: GUEST_CID,
             uds_path: JAIL_VSOCK.to_string(),
         })
         .await?;
+        control.check()?;
         api.put_balloon(&Balloon {
             amount_mib: 0,
             deflate_on_oom: true,
             stats_polling_interval_s: BALLOON_STATS_INTERVAL_S,
         })
         .await?;
+        control.check()?;
+        // InstanceStart may already have taken effect if its response is delayed.
+        // Let the bounded request settle, then let launch's abort path stop it.
         api.instance_start().await?;
+        control.check()?;
         if let Some(cpus) = &spec.cpu_pinning
         {
-            self.pin_vcpus(&unit_name(&spec.instance_id), spec.vcpus, cpus)
+            self.pin_vcpus(&unit_name(&spec.instance_id), spec.vcpus, cpus, control)
                 .await?;
         }
         Ok(())
     }
 
-    async fn pin_vcpus(&self, unit: &str, vcpus: u32, cpus: &[u32]) -> Result<(), SandboxError>
+    async fn pin_vcpus(
+        &self,
+        unit: &str,
+        vcpus: u32,
+        cpus: &[u32],
+        control: &LaunchControl,
+    ) -> Result<(), SandboxError>
     {
         let pid =
             self.systemd
@@ -578,6 +618,7 @@ impl Firecracker
         let deadline = Instant::now() + VCPU_THREAD_TIMEOUT;
         loop
         {
+            control.check()?;
             let cpus = cpus.to_vec();
             let pinned = blocking(move || pin_vcpu_threads(pid, &cpus)).await?;
             if pinned >= vcpus as usize
@@ -594,14 +635,20 @@ impl Firecracker
         }
     }
 
-    async fn boot(&self, spec: &SandboxSpec, paths: &JailPaths) -> Result<(), SandboxError>
+    async fn boot(
+        &self,
+        spec: &SandboxSpec,
+        paths: &JailPaths,
+        control: &LaunchControl,
+    ) -> Result<(), SandboxError>
     {
         let unit = unit_name(&spec.instance_id);
         let api = FirecrackerApi::new(&paths.api_socket);
-        let info = self.wait_for_api(&api, &unit, &paths.console).await?;
+        let info = self.wait_for_api(&api, &unit, &paths.console, control).await?;
+        control.check()?;
         if !info.is_started()
         {
-            self.configure_and_start(&api, spec).await?;
+            self.configure_and_start(&api, spec, control).await?;
         }
         Ok(())
     }
@@ -613,14 +660,19 @@ impl Firecracker
     ) -> Result<SandboxHandle, SandboxError>
     {
         let record = read_persisted_record(&paths.jail_dir, &spec.instance_id)
-            .unwrap_or_else(|| self.base_record(spec, paths));
+            .unwrap_or_else(|| self.base_record(&spec.instance_id, spec.generation, paths));
         let record = self.refresh(record).await?;
         let to_persist = record.clone();
         blocking(move || persist_record(&to_persist)).await?;
         Ok(SandboxHandle::new(record))
     }
 
-    async fn start_unit(&self, spec: &SandboxSpec, paths: &JailPaths) -> Result<(), SandboxError>
+    async fn start_unit(
+        &self,
+        spec: &SandboxSpec,
+        paths: &JailPaths,
+        control: &LaunchControl,
+    ) -> Result<(), SandboxError>
     {
         let unit = unit_name(&spec.instance_id);
         let writer = writer_argv(
@@ -636,10 +688,15 @@ impl Firecracker
         )?;
         let exec = vec!["/bin/sh".to_string(), "-c".to_string(), script];
         let properties = unit_properties(&self.config, spec, &paths.exit_file)?;
+        control.check()?;
         self.systemd
             .start_transient_service(&unit, &exec, &properties)
             .await?;
-        unit::wait_until_active(&self.systemd, &unit, &paths.exit_file, &paths.console).await
+        control.check()?;
+        tokio::select! {
+            result = unit::wait_until_active(&self.systemd, &unit, &paths.exit_file, &paths.console) => result,
+            () = wait_for_cancellation(control) => Err(SandboxError::LaunchCancelled),
+        }
     }
 
     async fn abort(&self, unit: &str, error: SandboxError) -> SandboxError
@@ -647,6 +704,10 @@ impl Firecracker
         if let Err(kill_error) = unit::kill_and_wait(&self.systemd, unit).await
         {
             tracing::warn!(unit, %kill_error, "could not stop a partially launched instance");
+            return SandboxError::LaunchCleanup {
+                launch: Box::new(error),
+                cleanup: Box::new(kill_error),
+            };
         }
         error
     }
@@ -689,8 +750,13 @@ impl Sandbox for Firecracker
         self.paths(instance_id).guest_socket
     }
 
-    async fn launch(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError>
+    async fn launch_controlled(
+        &self,
+        spec: &SandboxSpec,
+        control: LaunchControl,
+    ) -> Result<SandboxHandle, SandboxError>
     {
+        control.check()?;
         validate_spec(spec)?;
         let kernel = spec.kernel.clone().ok_or_else(|| {
             SandboxError::InvalidSpec("the Firecracker backend needs a kernel".into())
@@ -702,8 +768,18 @@ impl Sandbox for Firecracker
         {
             Some(state) if unit::is_running_state(&state) =>
             {
-                self.boot(spec, &paths).await?;
-                return self.finish(spec, &paths).await;
+                let result = async {
+                    self.boot(spec, &paths, &control).await?;
+                    let handle = self.finish(spec, &paths).await?;
+                    control.check()?;
+                    Ok(handle)
+                }
+                .await;
+                return match result
+                {
+                    Ok(handle) => Ok(handle),
+                    Err(error) => Err(self.abort(&unit, error).await),
+                };
             }
             Some(_) => unit::clear_stale_unit(&self.systemd, &unit).await?,
             None =>
@@ -711,22 +787,30 @@ impl Sandbox for Firecracker
         }
         let prepared_paths = paths.clone();
         let prepared_spec = spec.clone();
+        let prepared_record = self.base_record(&spec.instance_id, spec.generation, &paths);
+        let prepare_control = control.clone();
         blocking(move || {
+            prepare_control.check()?;
             fs::create_dir_all(&prepared_paths.root)
                 .map_err(io(format!("create {}", prepared_paths.root.display())))?;
-            prepare_jail(&prepared_paths, &prepared_spec, &kernel)
+            prepare_jail(&prepared_paths, &prepared_spec, &kernel)?;
+            persist_record(&prepared_record)
         })
         .await?;
-        let started = match self.start_unit(spec, &paths).await
-        {
-            Ok(()) => self.boot(spec, &paths).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = started
-        {
-            return Err(self.abort(&unit, error).await);
+        let result = async {
+            control.check()?;
+            self.start_unit(spec, &paths, &control).await?;
+            self.boot(spec, &paths, &control).await?;
+            let handle = self.finish(spec, &paths).await?;
+            control.check()?;
+            Ok(handle)
         }
-        self.finish(spec, &paths).await
+        .await;
+        match result
+        {
+            Ok(handle) => Ok(handle),
+            Err(error) => Err(self.abort(&unit, error).await),
+        }
     }
 
     async fn adopt(&self, record: &SandboxRecord) -> Result<Option<SandboxHandle>, SandboxError>
@@ -743,6 +827,39 @@ impl Sandbox for Firecracker
         }
         let record = self.refresh(record.clone()).await?;
         Ok(Some(SandboxHandle::new(record)))
+    }
+
+    async fn recover(
+        &self,
+        instance_id: &str,
+        record: Option<&SandboxRecord>,
+    ) -> Result<Option<SandboxHandle>, SandboxError>
+    {
+        validate_instance_id(instance_id)?;
+        let paths = self.paths(instance_id);
+        let record = record
+            .cloned()
+            .or_else(|| read_persisted_record(&paths.jail_dir, instance_id))
+            .unwrap_or_else(|| self.base_record(instance_id, 0, &paths));
+        Self::check_kind(&record)?;
+        if record.instance_id != instance_id || record.unit_name != unit_name(instance_id)
+        {
+            return Err(SandboxError::InvalidSpec(format!(
+                "sandbox recovery record does not belong to instance {instance_id}"
+            )));
+        }
+        let state = self.systemd.unit_active_state(&record.unit_name).await?;
+        if state.is_some()
+            || record
+                .runtime_dir
+                .try_exists()
+                .map_err(io(format!("stat {}", record.runtime_dir.display())))?
+        {
+            // Unit identity is enough to stop it. API/PID queries could fail even
+            // though this unit is alive, and must not prevent acquiring ownership.
+            return Ok(Some(SandboxHandle::new(record)));
+        }
+        Ok(None)
     }
 
     async fn shutdown(&self, handle: &SandboxHandle, mode: ShutdownMode)
@@ -924,6 +1041,7 @@ mod tests
         let properties =
             unit_properties(&config(), &spec, Path::new("/srv/x/exit_status")).unwrap();
         assert_eq!(properties.cpu_quota_per_sec_usec, Some(2_000_000));
+        assert!(properties.io_accounting);
         assert_eq!(properties.allowed_cpus, Some(vec![4, 5]));
         assert_eq!(properties.memory_max, None);
         assert_eq!(properties.kill_mode.as_deref(), Some("control-group"));
@@ -1085,5 +1203,47 @@ mod tests
         restarted.destroy(&adopted).await.unwrap();
         restarted.destroy(&adopted).await.unwrap();
         assert!(!record.runtime_dir.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root, /dev/kvm, systemd, firecracker+jailer and QUARRY_TEST_{FIRECRACKER,JAILER,KERNEL,ROOTFS,DATA,CONSOLE_WRITER}"]
+    async fn recovery_owns_an_unreachable_vm_and_finalization_failure_stops_it()
+    {
+        let variable =
+            |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
+        let backend = Firecracker::new(integration_config(), UnitBus::connect().await.unwrap())
+            .unwrap();
+        let instance_id = format!("fc-recovery-{}", std::process::id());
+        let mut spec = sample_spec(&instance_id);
+        spec.kernel = Some(PathBuf::from(variable("QUARRY_TEST_KERNEL")));
+        spec.rootfs = PathBuf::from(variable("QUARRY_TEST_ROOTFS"));
+        spec.data_volume = PathBuf::from(variable("QUARRY_TEST_DATA"));
+        spec.network.netns_path = None;
+        spec.network.tap_name = None;
+        spec.vcpus = 1;
+        spec.memory_mib = 256;
+        let handle = backend.launch(&spec).await.unwrap();
+        let record = handle.record();
+        let socket = record.api_socket.as_ref().unwrap();
+        let hidden_socket = socket.with_extension("unreachable");
+        fs::rename(socket, &hidden_socket).unwrap();
+        fs::remove_file(record.runtime_dir.join(crate::RECORD_FILE)).unwrap();
+
+        let recovered = backend.recover(&instance_id, None).await.unwrap().unwrap();
+        assert_eq!(recovered.record().unit_name, record.unit_name);
+        assert_eq!(
+            backend.status(&recovered).await.unwrap(),
+            SandboxState::Running
+        );
+        fs::rename(hidden_socket, socket).unwrap();
+
+        fs::create_dir(record.runtime_dir.join(format!("{}.tmp", crate::RECORD_FILE))).unwrap();
+        assert!(backend.launch(&spec).await.is_err());
+        assert_ne!(
+            backend.status(&recovered).await.unwrap(),
+            SandboxState::Running
+        );
+        backend.destroy(&recovered).await.unwrap();
+        assert!(backend.recover(&instance_id, None).await.unwrap().is_none());
     }
 }

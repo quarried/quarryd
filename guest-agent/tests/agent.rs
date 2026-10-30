@@ -28,6 +28,7 @@ else
   echo "Done (0.1s)! For help, type \"help\""
 fi
 while IFS= read -r line; do
+  if [ -n "$FAKE_COMMANDS_FILE" ]; then printf '%s\n' "$line" >> "$FAKE_COMMANDS_FILE"; fi
   case "$line" in
     list|"list uuids") echo "There are 3 of a max of 20 players online: a, b, c" ;;
     tps)
@@ -37,7 +38,7 @@ while IFS= read -r line; do
         echo "TPS from last 1m, 5m, 15m: *19.5, 20.0, 20.0"
       fi ;;
     mspt) echo "Unknown or incomplete command, see below for error"; echo "mspt<--[HERE]" ;;
-    "save-all flush") echo "> save-all flush"; echo "Saving the game (this may take a moment!)"; echo "Saved the game" ;;
+    "save-all flush") echo "> save-all flush"; echo "Saving the game (this may take a moment!)"; if [ -n "$FAKE_SAVE_DELAY" ]; then sleep "$FAKE_SAVE_DELAY"; fi; echo "Saved the game" ;;
     whoami) echo "pid $$" ;;
     capture) echo "first output"; echo "stderr excluded" >&2; sleep 0.1; echo "second output"; sleep 0.6; echo "late output" ;;
     flood) i=0; while [ "$i" -lt 100 ]; do printf 'line %s ' "$i"; head -c 4096 /dev/zero | tr '\000' x; printf '\n'; i=$((i+1)); done ;;
@@ -266,6 +267,23 @@ impl Host
         .await
     }
 
+    async fn prepare_snapshot(&mut self, request_id: &str) -> guest_proto::SnapshotPrepared
+    {
+        self.send(HostBody::PrepareSnapshot(PrepareSnapshot {
+            request_id: request_id.to_owned(),
+        }))
+        .await;
+        self.wait_for(|body| match body
+        {
+            GuestBody::SnapshotPrepared(prepared) if prepared.request_id == request_id =>
+            {
+                Some(prepared.clone())
+            }
+            _ => None,
+        })
+        .await
+    }
+
     fn logs(&self) -> Vec<String>
     {
         self.received
@@ -481,8 +499,10 @@ async fn prepare_snapshot_and_resume_writes_run_in_order()
 {
     let harness = Harness::start();
     let mut host = harness.configured().await;
-    host.send(HostBody::PrepareSnapshot(PrepareSnapshot {}))
-        .await;
+    host.send(HostBody::PrepareSnapshot(PrepareSnapshot {
+        request_id: "snapshot-1".to_owned(),
+    }))
+    .await;
     let prepared = host
         .wait_for(|body| match body
         {
@@ -491,7 +511,10 @@ async fn prepare_snapshot_and_resume_writes_run_in_order()
         })
         .await;
     assert!(prepared.ok, "{}", prepared.error);
-    host.send(HostBody::ResumeWrites(ResumeWrites {})).await;
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "snapshot-1".to_owned(),
+    }))
+    .await;
     host.command("marker").await;
     host.log_containing("> marker").await;
     let logs = host.logs();
@@ -501,6 +524,183 @@ async fn prepare_snapshot_and_resume_writes_run_in_order()
     let save_on = position(&logs, "> save-on");
     let marker = position(&logs, "> marker");
     assert!(save_off < save_all && save_all < saved && saved < save_on && save_on < marker);
+}
+
+#[tokio::test]
+async fn a_prepared_snapshot_can_resume_after_the_host_rebinds_its_listener()
+{
+    let mut harness = Harness::start();
+    let commands = harness.dir.path().join("commands");
+    let mut host = harness.accept().await;
+    host.send(harness.configure(&[("FAKE_COMMANDS_FILE", commands.to_str().unwrap())], &[]))
+        .await;
+    host.ready().await;
+    let first_pid = host.earlier_log_containing("pid ").await;
+    host.send(HostBody::PrepareSnapshot(PrepareSnapshot {
+        request_id: "snapshot-1".to_owned(),
+    }))
+    .await;
+    let prepared = host
+        .wait_for(|body| match body
+        {
+            GuestBody::SnapshotPrepared(prepared) => Some(prepared.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(prepared.ok, "{}", prepared.error);
+
+    drop(host);
+    drop(harness.listener.take());
+    std::fs::remove_file(&harness.socket).unwrap();
+    harness.listener = Some(UnixListener::bind(&harness.socket).unwrap());
+    let mut host = harness.accept().await;
+    assert_eq!(host.ready().await, "1.21.4");
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "snapshot-1".to_owned(),
+    }))
+    .await;
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "snapshot-1".to_owned(),
+    }))
+    .await;
+    host.command("whoami").await;
+    assert_eq!(host.log_containing("pid ").await, first_pid);
+    let commands = std::fs::read_to_string(commands).unwrap();
+    assert_eq!(
+        commands.lines().filter(|line| *line == "save-off").count(),
+        1
+    );
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|line| *line == "save-all flush")
+            .count(),
+        1
+    );
+    assert_eq!(
+        commands.lines().filter(|line| *line == "save-on").count(),
+        1
+    );
+    assert!(commands.find("save-all flush").unwrap() < commands.find("save-on").unwrap());
+
+    host.send(HostBody::Shutdown(Shutdown { deadline_ms: 1000 }))
+        .await;
+    assert_eq!(host.shutdown_complete().await, 0);
+    assert_eq!(harness.exit_code().await, Some(0));
+}
+
+#[tokio::test]
+async fn snapshot_ids_cannot_reuse_or_release_another_attempts_freeze()
+{
+    let mut harness = Harness::start();
+    let mut host = harness.configured().await;
+    assert!(host.prepare_snapshot("first").await.ok);
+    assert!(!host.prepare_snapshot("first").await.ok);
+    assert!(!host.prepare_snapshot("second").await.ok);
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "second".to_owned(),
+    }))
+    .await;
+    assert!(!host.prepare_snapshot("third").await.ok);
+
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "first".to_owned(),
+    }))
+    .await;
+    host.command("first-resumed").await;
+    host.log_containing("> first-resumed").await;
+    assert!(host.prepare_snapshot("fourth").await.ok);
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "first".to_owned(),
+    }))
+    .await;
+    assert!(!host.prepare_snapshot("fifth").await.ok);
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "fourth".to_owned(),
+    }))
+    .await;
+    host.send(HostBody::Shutdown(Shutdown { deadline_ms: 1000 }))
+        .await;
+    assert_eq!(host.shutdown_complete().await, 0);
+    assert_eq!(harness.exit_code().await, Some(0));
+}
+
+#[tokio::test]
+async fn a_cancelled_save_completion_cannot_prepare_a_later_snapshot()
+{
+    let mut harness = Harness::start();
+    let mut host = harness.accept().await;
+    host.send(harness.configure(&[("FAKE_SAVE_DELAY", "0.3")], &[]))
+        .await;
+    host.ready().await;
+    host.send(HostBody::PrepareSnapshot(PrepareSnapshot {
+        request_id: "cancelled".to_owned(),
+    }))
+    .await;
+    host.log_containing("Saving the game").await;
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "cancelled".to_owned(),
+    }))
+    .await;
+    assert!(!host.prepare_snapshot("too-early").await.ok);
+    host.command("cancelled-save-drained").await;
+    host.log_containing("> cancelled-save-drained").await;
+    assert!(host.prepare_snapshot("fresh").await.ok);
+    assert!(host.received.iter().all(|body| !matches!(
+        body,
+        GuestBody::SnapshotPrepared(prepared) if prepared.request_id == "cancelled" && prepared.ok
+    )));
+    host.send(HostBody::ResumeWrites(ResumeWrites {
+        request_id: "fresh".to_owned(),
+    }))
+    .await;
+    host.send(HostBody::Shutdown(Shutdown { deadline_ms: 1000 }))
+        .await;
+    assert_eq!(host.shutdown_complete().await, 0);
+    assert_eq!(harness.exit_code().await, Some(0));
+}
+
+#[tokio::test]
+#[ignore = "waits for the guest's real 60-second snapshot auto-resume deadline"]
+async fn a_prepared_snapshot_resumes_without_a_resume_command()
+{
+    let mut harness = Harness::start();
+    let commands = harness.dir.path().join("commands");
+    let mut host = harness.accept().await;
+    host.send(harness.configure(&[("FAKE_COMMANDS_FILE", commands.to_str().unwrap())], &[]))
+        .await;
+    host.ready().await;
+    host.send(HostBody::PrepareSnapshot(PrepareSnapshot {
+        request_id: "snapshot-1".to_owned(),
+    }))
+    .await;
+    let prepared = host
+        .wait_for(|body| match body
+        {
+            GuestBody::SnapshotPrepared(prepared) => Some(prepared.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(prepared.ok, "{}", prepared.error);
+    timeout(Duration::from_secs(65), async {
+        loop
+        {
+            let trace = std::fs::read_to_string(&commands).unwrap();
+            if trace.lines().any(|line| line == "save-on")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("world writes stayed disabled without a resume command");
+    assert!(harness.stderr().contains("no ResumeWrites"));
+
+    host.send(HostBody::Shutdown(Shutdown { deadline_ms: 1000 }))
+        .await;
+    assert_eq!(host.shutdown_complete().await, 0);
+    assert_eq!(harness.exit_code().await, Some(0));
 }
 
 #[tokio::test]

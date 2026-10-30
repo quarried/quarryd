@@ -25,6 +25,7 @@ pub enum FakeOperation
     DetachPublic,
     SetPublicMode,
     ApplyPublic,
+    CleanupPublic,
     Attach,
     Detach,
     Counters,
@@ -39,6 +40,7 @@ pub enum FakeCall
     AttachPublic(String, Ipv4Addr),
     DetachPublic(String),
     SetPublicMode(String, PublicIpMode),
+    CleanupPublic(Ipv4Addr),
     Attach(InstanceNetworkSpec),
     Detach(String),
     Counters(String),
@@ -247,12 +249,43 @@ impl FakeNetwork
             let (_, message) = state.pending_failures.remove(index);
             return Err(NetworkError::Injected(message));
         }
+        let retired_addresses: std::collections::BTreeSet<_> = state
+            .persisted
+            .public
+            .retired_bindings
+            .iter()
+            .map(|binding| binding.address)
+            .collect();
+        if !retired_addresses.is_empty()
+        {
+            state
+                .nft_transactions
+                .push(nft::public_retirement_guard(&state.persisted.public));
+        }
+        for address in retired_addresses
+        {
+            state.calls.push(FakeCall::CleanupPublic(address));
+            if let Some(index) = state
+                .pending_failures
+                .iter()
+                .position(|(operation, _)| *operation == FakeOperation::CleanupPublic)
+            {
+                let (_, message) = state.pending_failures.remove(index);
+                return Err(NetworkError::Injected(message));
+            }
+        }
         state
             .nft_transactions
             .push(nft::public_rules(&state.persisted.public));
         state.proxies = state.persisted.public.proxies();
-        state.persisted.public.retired_proxies.clear();
-        self.persist(state)?;
+        let mut persisted = state.persisted.clone();
+        persisted.public.retired_proxies.clear();
+        persisted.public.retired_bindings.clear();
+        if let Some(path) = &self.path
+        {
+            state_file::save(path, &persisted)?;
+        }
+        state.persisted = persisted;
         self.responder.publish(&state.persisted.public);
         state.applied_public = Some(state.persisted.public.clone());
         Ok(())
@@ -338,9 +371,9 @@ impl Network for FakeNetwork
             FakeCall::SetPublicMode(instance_id.to_string(), mode),
             FakeOperation::SetPublicMode,
         )?;
-        if let Some(binding) = state.persisted.public.bindings.get_mut(instance_id)
+        if state.persisted.public.bindings.contains_key(instance_id)
         {
-            binding.mode = mode;
+            state.persisted.public.set_mode(instance_id, mode);
             self.apply_public(&mut state)?;
         }
         Ok(())
@@ -391,11 +424,25 @@ impl Network for FakeNetwork
         {
             self.persist(&state)?;
             state.nft_transactions.push(nft::instance_rules(spec));
-            if let Some(binding) = state.persisted.public.bindings.get_mut(&spec.instance_id)
+        }
+        if state
+            .persisted
+            .public
+            .bindings
+            .contains_key(&spec.instance_id)
+        {
+            if state.persisted.public.bindings[&spec.instance_id].guest_ip != spec.guest_ip
             {
-                binding.guest_ip = spec.guest_ip;
-                self.apply_public(&mut state)?;
+                state
+                    .persisted
+                    .public
+                    .set_mode(&spec.instance_id, PublicIpMode::Starting);
             }
+            state
+                .persisted
+                .public
+                .update_guest_ip(&spec.instance_id, spec.guest_ip);
+            self.apply_public(&mut state)?;
         }
         Ok(attachment)
     }

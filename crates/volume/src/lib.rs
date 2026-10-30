@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub use error::VolumeError;
 pub use file::FileVolume;
@@ -53,6 +54,47 @@ pub trait Volume: Send + Sync
 }
 
 const MAX_NAME_LEN: usize = 127;
+
+/// A bounded, backend-safe identity for a logical disk. Length prefixes keep
+/// component boundaries unambiguous; the digest also preserves arbitrary names.
+pub fn disk_volume_name(instance_id: &str, disk_name: &str) -> String
+{
+    let mut hash = Sha256::new();
+    hash.update(b"quarryd/disk/v1\0");
+    for component in [instance_id, disk_name]
+    {
+        hash.update((component.len() as u64).to_be_bytes());
+        hash.update(component.as_bytes());
+    }
+    let digest: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("qd-{digest}")
+}
+
+#[cfg(test)]
+mod name_tests
+{
+    use super::*;
+
+    #[test]
+    fn disk_identity_preserves_boundaries_and_unsanitized_names()
+    {
+        assert_ne!(disk_volume_name("a-b", "c"), disk_volume_name("a", "b-c"));
+        assert_ne!(disk_volume_name("a", "b/c"), disk_volume_name("a", "b-c"));
+        let prefix = "x".repeat(100);
+        assert_ne!(
+            disk_volume_name("a", &format!("{prefix}b")),
+            disk_volume_name("a", &format!("{prefix}c"))
+        );
+        let name = disk_volume_name("snapshot-test", "world_tmeta");
+        assert_eq!(name.len(), 67);
+        validate_name(&name).unwrap();
+        assert_eq!(name, disk_volume_name("snapshot-test", "world_tmeta"));
+    }
+}
 
 pub(crate) fn validate_name(name: &str) -> Result<(), VolumeError>
 {

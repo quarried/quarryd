@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use guest_proto::{
@@ -8,6 +8,7 @@ use guest_proto::{
     SnapshotPrepared,
 };
 use network::NetworkAttachment;
+use prost::Message;
 use proto::v1::{InstanceSpec, InstanceStatus, Phase, RestartPolicy, RunState};
 use sandbox::{SandboxHandle, SandboxRecord, SandboxState, ShutdownMode};
 use store::{ActualState, InstanceRow};
@@ -16,18 +17,23 @@ use tracing::Instrument;
 use volume::VolumeInfo;
 
 use crate::ReconcilerError;
-use crate::admission::{Decision, Verdict, volume_name};
+use crate::admission::{Decision, Verdict};
 use crate::guest_channel::{GuestChannel, GuestEvent, GuestLimits};
 use crate::leases::unix_ms_now;
 use crate::lifecycle::Lifecycle;
 use crate::provision::Prepared;
-use crate::reconciler::{GuestView, Inner, InstanceView, SupervisorLink, lock};
+use crate::reconciler::{
+    GuestView, Inner, InstanceView, SupervisorLink, decode_spec, lock, normalized_spec,
+};
 
 pub(crate) const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: Duration = HEALTH_INTERVAL.saturating_mul(3);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-const SNAPSHOT_PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const SNAPSHOT_FREEZE_TIMEOUT: Duration = Duration::from_secs(55);
+#[cfg(test)]
+const SNAPSHOT_FREEZE_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_WAKE: Duration = Duration::from_secs(3600);
 const COMMAND_BUFFER: usize = 8;
 
@@ -58,20 +64,20 @@ impl Desired
 
     fn admitted(&self) -> bool
     {
-        matches!(
-            &self.decision,
-            Some(Decision { generation, verdict: Verdict::Admitted(_) }) if *generation == self.spec.generation
-        )
+        self.decision.as_ref().is_some_and(|decision| {
+            decision.matches_spec(&self.spec) && matches!(decision.verdict, Verdict::Admitted(_))
+        })
     }
 
     fn rejection(&self) -> Option<&str>
     {
         match &self.decision
         {
-            Some(Decision {
-                generation,
-                verdict: Verdict::Rejected(reason),
-            }) if *generation == self.spec.generation => Some(reason),
+            Some(decision) if decision.matches_spec(&self.spec) => match &decision.verdict
+            {
+                Verdict::Rejected(reason) => Some(reason),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -88,6 +94,114 @@ pub(crate) struct TakenSnapshot
     pub volume: String,
     pub disk: String,
     pub lease_epoch: u64,
+    _cleanup: SnapshotCleanup,
+}
+
+/// Owns a local snapshot even if its requester or the supervisor is cancelled.
+/// The backend task is not aborted: lvcreate may have side effects after its
+/// future is dropped, so cleanup waits for its actual completion.
+struct SnapshotCleanup
+{
+    backend: Arc<dyn volume::Volume>,
+    name: String,
+}
+
+impl Drop for SnapshotCleanup
+{
+    fn drop(&mut self)
+    {
+        let backend = Arc::clone(&self.backend);
+        let name = self.name.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                loop
+                {
+                    match backend.delete(&name).await
+                    {
+                        Ok(()) => return,
+                        Err(error) => tracing::warn!(snapshot = %name, error = %error, "local snapshot cleanup failed; retrying"),
+                    }
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+            });
+        }
+    }
+}
+
+async fn authority_lost(
+    inner: Arc<Inner>,
+    id: String,
+    spec: Arc<InstanceSpec>,
+    epoch: u64,
+    mut desired: watch::Receiver<Desired>,
+    poke: Arc<Notify>,
+    require_boot_authority: bool,
+) -> ReconcilerError
+{
+    let denied = |reason: &str| {
+        if require_boot_authority
+        {
+            tracing::warn!(reason, "boot authority lost; cancelling sandbox launch");
+            ReconcilerError::Sandbox(sandbox::SandboxError::LaunchCancelled)
+        }
+        else
+        {
+            ReconcilerError::SnapshotRefused(reason.to_owned())
+        }
+    };
+    loop
+    {
+        let Some(lease) = lock(&inner.leases).get(&id)
+        else
+        {
+            return denied("lease is missing");
+        };
+        if lease.epoch != epoch || !lease.is_valid(Instant::now())
+        {
+            return denied("lease changed or expired");
+        }
+        let current = match inner.parts.store.get_instance(&id)
+        {
+            Ok(Some(row)) if !row.desired_deleted => match decode_spec(&row.spec)
+            {
+                Ok(spec) => spec,
+                Err(error) => return error,
+            },
+            Ok(_) =>
+            {
+                return denied("instance was deleted");
+            }
+            Err(error) => return error.into(),
+        };
+        let published = desired.borrow_and_update().clone();
+        let latest = Desired {
+            spec: Arc::new(current),
+            deleted: false,
+            decision: published.decision,
+        };
+        if !same_runtime_spec(&spec, &latest.spec) || latest.rejection().is_some()
+        {
+            return denied("desired specification changed or was rejected");
+        }
+        if require_boot_authority
+            && (!latest.admitted()
+                || (!latest.spec.secrets.is_empty()
+                    && !lock(&inner.secrets)
+                        .get(&id)
+                        .is_some_and(|(generation, _)| *generation == latest.spec.generation)))
+        {
+            return denied("boot admission or required secrets changed");
+        }
+        let until = lease.expires_at.min(Instant::now() + STATUS_POLL_INTERVAL);
+        tokio::select! {
+            _ = sleep_until(until) => {},
+            _ = poke.notified() => {},
+            changed = desired.changed() => if changed.is_err() {
+                return ReconcilerError::ShutDown;
+            },
+        }
+    }
 }
 
 pub(crate) enum Command
@@ -143,6 +257,47 @@ fn describe_exit(code: Option<i32>) -> String
     }
 }
 
+pub(crate) fn same_runtime_spec(left: &InstanceSpec, right: &InstanceSpec) -> bool
+{
+    let mut left = normalized_spec(left);
+    let mut right = normalized_spec(right);
+    left.lease = None;
+    right.lease = None;
+    left == right
+}
+
+async fn public_mode_worker(
+    inner: Arc<Inner>,
+    id: String,
+    mut modes: watch::Receiver<Option<network::PublicIpMode>>,
+)
+{
+    loop
+    {
+        let mode = *modes.borrow_and_update();
+        let retry = if let Some(mode) = mode
+        {
+            match inner.parts.network.set_public_mode(&id, mode).await
+            {
+                Ok(()) => false,
+                Err(error) =>
+                {
+                    tracing::warn!(error = %error, "public mode update failed; retrying independently of sandbox lifecycle");
+                    true
+                }
+            }
+        }
+        else
+        {
+            false
+        };
+        tokio::select! {
+            changed = modes.changed() => if changed.is_err() { return; },
+            _ = tokio::time::sleep(RETRY_DELAY), if retry => {}
+        }
+    }
+}
+
 /// One task per instance (section 4.4): owns the sandbox handle, the guest
 /// channel, the restart policy, crash detection, and graceful stop.
 pub(crate) struct Supervisor
@@ -163,10 +318,15 @@ pub(crate) struct Supervisor
     pub(crate) attachment: Option<NetworkAttachment>,
     pub(crate) handle: Option<SandboxHandle>,
     last_record: Option<SandboxRecord>,
+    recovery_pending: bool,
     guest: Option<GuestChannel>,
     abuse: Arc<AtomicU64>,
     pub(crate) running_spec: Option<Arc<InstanceSpec>>,
+    legacy_spec: Option<Arc<InstanceSpec>>,
     pub(crate) prepared: Option<Prepared>,
+    pub(crate) prepared_spec: Option<Arc<InstanceSpec>>,
+    public_modes: watch::Sender<Option<network::PublicIpMode>>,
+    public_mode_task: tokio::task::JoinHandle<()>,
 
     connection: Option<u64>,
     guest_ready: bool,
@@ -212,6 +372,11 @@ impl Supervisor
         let (command_sender, commands) = mpsc::channel(COMMAND_BUFFER);
         let poke = Arc::new(Notify::new());
         let span = tracing::info_span!(parent: &inner.node_span, "instance", instance_id = %row.id);
+        let (public_modes, mode_receiver) = watch::channel(None);
+        let public_mode_task = tokio::spawn(
+            public_mode_worker(Arc::clone(&inner), row.id.clone(), mode_receiver)
+                .instrument(span.clone()),
+        );
         let now = Instant::now();
         let record: Option<SandboxRecord> = row
             .sandbox_record
@@ -236,10 +401,20 @@ impl Supervisor
             attachment,
             handle: None,
             last_record: record.clone(),
+            recovery_pending: true,
             guest: None,
             abuse: Arc::new(AtomicU64::new(0)),
-            running_spec: Some(Arc::clone(&spec)),
+            running_spec: row
+                .applied_spec
+                .as_deref()
+                .map(decode_spec)
+                .transpose()?
+                .map(Arc::new),
+            legacy_spec: row.applied_spec.is_none().then(|| Arc::clone(&spec)),
             prepared: None,
+            prepared_spec: None,
+            public_modes,
+            public_mode_task,
             connection: None,
             guest_ready: false,
             health: None,
@@ -268,9 +443,10 @@ impl Supervisor
         };
         supervisor.last_emitted = Some(supervisor.status());
         supervisor.publish_view();
-        if let Some(record) = record
+        if let Err(error) = supervisor.recover().instrument(span.clone()).await
         {
-            supervisor.adopt(record).instrument(span.clone()).await;
+            tracing::warn!(error = %error, "sandbox recovery uncertain; retaining ownership and retrying");
+            supervisor.retry_at = Some(Instant::now() + RETRY_DELAY);
         }
         let task = tokio::spawn(supervisor.run().instrument(span));
         Ok(SupervisorLink {
@@ -281,16 +457,61 @@ impl Supervisor
         })
     }
 
-    async fn adopt(&mut self, record: SandboxRecord)
+    async fn recover(&mut self) -> Result<(), ReconcilerError>
     {
-        let adopted = match self.inner.parts.sandbox.adopt(&record).await
+        let record = self
+            .handle
+            .as_ref()
+            .map(|handle| handle.record().clone())
+            .or_else(|| self.last_record.clone());
+        let had_record = record.is_some();
+        let recovered = self
+            .inner
+            .parts
+            .sandbox
+            .recover(&self.id, record.as_ref())
+            .await?;
+        if let Some(handle) = &recovered
         {
-            Ok(adopted) => adopted,
-            Err(error) =>
+            self.handle = Some(handle.clone());
+            self.commit()?;
+        }
+        let desired = self.latest_desired()?;
+        let must_stop = desired.deleted
+            || !desired.run_requested()
+            || !self.lease_valid()
+            || desired.rejection().is_some();
+        if let Some(handle) = &recovered
+            && Lifecycle::holds_sandbox(self.phase)
+            && !must_stop
+            && self.inner.parts.sandbox.requires_restart(handle.record())
+        {
+            if let Err(error) = self.bind_guest()
             {
-                tracing::warn!(error = %error, "adoption failed");
-                None
+                tracing::warn!(error = %error, "could not bind guest channel during sandbox migration");
             }
+            self.graceful_stop("restarting to upgrade sandbox runtime layout".to_owned())
+                .await?;
+            self.recovery_pending = false;
+            self.commit()?;
+            return Ok(());
+        }
+        let adopted = match recovered
+        {
+            Some(handle) if Lifecycle::holds_sandbox(self.phase) && !must_stop =>
+            {
+                match self.inner.parts.sandbox.adopt(handle.record()).await
+                {
+                    Ok(adopted) => adopted,
+                    Err(error) =>
+                    {
+                        tracing::warn!(error = %error, "adoption failed; stopping the recorded sandbox before recovery");
+                        self.stop_sandbox_now().await?;
+                        None
+                    }
+                }
+            }
+            other => other,
         };
         let now = Instant::now();
         match adopted
@@ -305,6 +526,13 @@ impl Supervisor
                 );
                 self.handle = Some(handle);
                 self.sandbox_state = "running".to_owned();
+                if self.running_spec.is_none() && self.phase == Phase::Booting
+                {
+                    self.fail("applied specification unavailable after restart".to_owned())
+                        .await?;
+                    self.recovery_pending = false;
+                    return Ok(());
+                }
                 if let Err(error) = self.bind_guest()
                 {
                     tracing::warn!(error = %error, "could not re-bind the guest channel");
@@ -333,17 +561,18 @@ impl Supervisor
             {
                 tracing::warn!(phase = %self.phase, "destroying a stray sandbox left behind by a crash");
                 self.handle = Some(handle);
-                self.stop_sandbox_now().await;
-                if let Err(error) = self.commit()
-                {
-                    tracing::warn!(error = %error, "persisting after stray cleanup failed");
-                }
+                self.stop_sandbox_now().await?;
+                self.commit()?;
             }
             None =>
             {
                 self.sandbox_state = "missing".to_owned();
-                let result = match self.phase
+                // adopt returning None proves only that the sandbox is not usable;
+                // recover may still have found a live or partially launched unit.
+                self.stop_sandbox_now().await?;
+                match self.phase
                 {
+                    Phase::Booting if !had_record => self.commit(),
                     Phase::Booting | Phase::Starting | Phase::Running =>
                     {
                         tracing::warn!(phase = %self.phase, "sandbox is gone; not adoptable");
@@ -355,13 +584,11 @@ impl Supervisor
                         self.transition(Phase::Stopped, reason).await
                     }
                     _ => self.commit(),
-                };
-                if let Err(error) = result
-                {
-                    tracing::warn!(error = %error, "recording a non-adoptable sandbox failed");
-                }
+                }?;
             }
         }
+        self.recovery_pending = false;
+        Ok(())
     }
 
     pub(crate) fn bind_guest(&mut self) -> Result<(), ReconcilerError>
@@ -370,6 +597,10 @@ impl Supervisor
         self.connection = None;
         self.guest_ready = false;
         let path = self.inner.parts.sandbox.guest_socket_path(&self.id);
+        let uid = self
+            .uid
+            .ok_or(ReconcilerError::MissingField("instance uid"))?;
+        let (uid, gid) = self.inner.parts.sandbox.guest_socket_owner(uid, uid);
         let limits = GuestLimits {
             rate_capacity: self.inner.config.guest_rate_capacity,
             rate_per_sec: self.inner.config.guest_rate_per_sec,
@@ -377,6 +608,8 @@ impl Supervisor
         self.guest = Some(GuestChannel::bind(
             &self.id,
             &path,
+            uid,
+            gid,
             limits,
             Arc::clone(&self.abuse),
         )?);
@@ -475,14 +708,19 @@ impl Supervisor
             }
             self.retry_at = None;
         }
+        if self.recovery_pending
+        {
+            self.recover().await?;
+        }
         loop
         {
             if self.finished
             {
                 return Ok(());
             }
-            let desired = self.desired.borrow_and_update().clone();
-            self.sync_public_mode(&desired.spec).await?;
+            let desired = self.latest_desired()?;
+            self.desired.borrow_and_update();
+            self.sync_public_mode(&desired.spec);
             let progressed = match self.phase
             {
                 Phase::Pending | Phase::Unspecified => self.step_pending(&desired).await?,
@@ -522,6 +760,63 @@ impl Supervisor
     fn lease_valid(&self) -> bool
     {
         lock(&self.inner.leases).is_valid(&self.id, Instant::now())
+    }
+
+    fn latest_desired(&self) -> Result<Desired, ReconcilerError>
+    {
+        let mut desired = self.desired.borrow().clone();
+        match self.inner.parts.store.get_instance(&self.id)?
+        {
+            Some(row) =>
+            {
+                desired.spec = Arc::new(decode_spec(&row.spec)?);
+                desired.deleted = row.desired_deleted;
+            }
+            None => desired.deleted = true,
+        }
+        Ok(desired)
+    }
+
+    fn boot_blocker(&self, spec: &InstanceSpec) -> Result<Option<String>, ReconcilerError>
+    {
+        let desired = self.latest_desired()?;
+        let reason = if desired.deleted
+        {
+            Some("deleted before boot".to_owned())
+        }
+        else if !same_runtime_spec(spec, &desired.spec)
+        {
+            Some("desired specification changed before boot".to_owned())
+        }
+        else if let Some(reason) = desired.rejection()
+        {
+            Some(format!("specification rejected: {reason}"))
+        }
+        else if !desired.admitted()
+        {
+            Some("waiting for admission of the current specification".to_owned())
+        }
+        else
+        {
+            self.blocker(&desired).map(str::to_owned)
+        };
+        Ok(reason)
+    }
+
+    pub(crate) fn launch_authority_lost(
+        &self,
+        spec: Arc<InstanceSpec>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ReconcilerError> + Send>>
+    {
+        Box::pin(authority_lost(
+            Arc::clone(&self.inner),
+            self.id.clone(),
+            spec,
+            lock(&self.inner.leases).epoch(&self.id),
+            self.desired.clone(),
+            Arc::clone(&self.poke),
+            true,
+        ))
     }
 
     fn secrets_ready(&self, spec: &InstanceSpec) -> bool
@@ -583,6 +878,7 @@ impl Supervisor
         if !desired.run_requested() && lock(&self.inner.ipam).is_some()
         {
             self.prepared = Some(self.prepare(&desired.spec).await?);
+            self.prepared_spec = Some(Arc::clone(&desired.spec));
             self.observed_generation = desired.spec.generation;
             self.running_spec = Some(Arc::clone(&desired.spec));
             self.transition(Phase::Stopped, RUN_STATE_STOPPED.to_owned())
@@ -595,7 +891,6 @@ impl Supervisor
             return Ok(false);
         }
         self.observed_generation = desired.spec.generation;
-        self.running_spec = Some(Arc::clone(&desired.spec));
         self.transition(Phase::Preparing, String::new()).await?;
         Ok(true)
     }
@@ -620,16 +915,30 @@ impl Supervisor
         {
             return Ok(false);
         }
+        if !desired.run_requested()
+        {
+            self.transition(Phase::Stopped, RUN_STATE_STOPPED.to_owned())
+                .await?;
+            return Ok(true);
+        }
+        if let Some(blocker) = self.blocker(desired)
+        {
+            self.set_reason(blocker)?;
+            return Ok(false);
+        }
         let spec = Arc::clone(&desired.spec);
         if self.observed_generation != spec.generation
         {
             self.observed_generation = spec.generation;
             self.commit()?;
         }
-        self.running_spec = Some(Arc::clone(&spec));
         match self.prepare(&spec).await
         {
-            Ok(prepared) => self.prepared = Some(prepared),
+            Ok(prepared) =>
+            {
+                self.prepared = Some(prepared);
+                self.prepared_spec = Some(Arc::clone(&spec));
+            }
             Err(error) =>
             {
                 tracing::warn!(error = %error, "preparation failed");
@@ -637,26 +946,26 @@ impl Supervisor
                 return Ok(true);
             }
         }
-        if self.desired.has_changed().unwrap_or(false)
-        {
-            let latest = self.desired.borrow().spec.generation;
-            if latest != spec.generation
-            {
-                return Ok(true);
-            }
-        }
         self.inner
             .parts
             .metrics
             .observe_boot_phase("preparing", self.phase_started.elapsed());
-        self.boot(spec).await?;
-        Ok(true)
+        self.boot(spec).await
     }
 
-    async fn boot(&mut self, spec: Arc<InstanceSpec>) -> Result<(), ReconcilerError>
+    async fn boot(&mut self, spec: Arc<InstanceSpec>) -> Result<bool, ReconcilerError>
     {
+        if let Some(reason) = self.boot_blocker(&spec)?
+        {
+            self.set_reason(&reason)?;
+            return Ok(false);
+        }
+        // Write the authorized boot intent before launch can create a unit. There
+        // is no previous live sandbox here; recovery can identify this exact spec.
         self.observed_generation = spec.generation;
         self.running_spec = Some(Arc::clone(&spec));
+        self.legacy_spec = None;
+        self.prepared_spec = Some(Arc::clone(&spec));
         self.shutdown_complete = false;
         self.ready_deadline = None;
         self.transition(Phase::Booting, String::new()).await?;
@@ -666,11 +975,43 @@ impl Supervisor
             tracing::warn!(error = %error, "launch failed");
             self.fail(format!("launch failed: {error}")).await?;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn step_booting(&mut self, desired: &Desired) -> Result<bool, ReconcilerError>
     {
+        let spec = self
+            .running_spec
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&desired.spec));
+        if let Some(reason) = self.boot_blocker(&spec)?
+        {
+            if self.handle.is_some() || desired.deleted || desired.rejection().is_some()
+            {
+                self.fail(reason).await?;
+                return Ok(true);
+            }
+            if desired.admitted() && !desired.run_requested()
+            {
+                self.transition(Phase::Stopped, RUN_STATE_STOPPED.to_owned())
+                    .await?;
+                return Ok(true);
+            }
+            self.connect_deadline = None;
+            self.ready_deadline = None;
+            self.set_reason(&reason)?;
+            // A changed spec is prepared again only once its admission is known.
+            if desired.admitted()
+                && self.wants_running(desired)
+                && !same_runtime_spec(&spec, &desired.spec)
+            {
+                self.running_spec = Some(Arc::clone(&desired.spec));
+                self.prepared = None;
+                self.prepared_spec = None;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         if self.handle.is_none()
         {
             if self.phase == Phase::Starting
@@ -683,18 +1024,19 @@ impl Supervisor
                 self.fail("deleted during boot".to_owned()).await?;
                 return Ok(true);
             }
-            let spec = self
-                .running_spec
-                .clone()
-                .unwrap_or_else(|| Arc::clone(&desired.spec));
             if self
-                .prepared
+                .prepared_spec
                 .as_ref()
-                .is_none_or(|prepared| prepared.generation != spec.generation)
+                .is_none_or(|prepared| !same_runtime_spec(prepared, &spec))
+                || self.prepared.is_none()
             {
                 match self.prepare(&spec).await
                 {
-                    Ok(prepared) => self.prepared = Some(prepared),
+                    Ok(prepared) =>
+                    {
+                        self.prepared = Some(prepared);
+                        self.prepared_spec = Some(Arc::clone(&spec));
+                    }
                     Err(error) =>
                     {
                         self.fail(format!("preparation failed: {error}")).await?;
@@ -702,6 +1044,14 @@ impl Supervisor
                     }
                 }
             }
+            if let Some(reason) = self.boot_blocker(&spec)?
+            {
+                self.set_reason(&reason)?;
+                return Ok(false);
+            }
+            self.running_spec = Some(Arc::clone(&spec));
+            self.observed_generation = spec.generation;
+            self.commit()?;
             self.connect_deadline = Some(Instant::now() + self.inner.config.guest_connect_timeout);
             if let Err(error) = self.launch().await
             {
@@ -771,7 +1121,13 @@ impl Supervisor
         {
             Some("stopped".to_owned())
         }
-        else if desired.admitted() && desired.spec.generation != self.observed_generation
+        else if desired.admitted()
+            && (desired.spec.generation != self.observed_generation
+                || self
+                    .running_spec
+                    .as_ref()
+                    .or(self.legacy_spec.as_ref())
+                    .is_none_or(|running| !same_runtime_spec(running, &desired.spec)))
         {
             Some(format!(
                 "restarting for generation {}",
@@ -826,13 +1182,17 @@ impl Supervisor
         }
         if desired.admitted()
             && !desired.run_requested()
-            && self.observed_generation != desired.spec.generation
+            && self
+                .running_spec
+                .as_ref()
+                .is_none_or(|running| !same_runtime_spec(running, &desired.spec))
         {
             self.prepared = Some(self.prepare(&desired.spec).await?);
+            self.prepared_spec = Some(Arc::clone(&desired.spec));
             self.observed_generation = desired.spec.generation;
             self.running_spec = Some(Arc::clone(&desired.spec));
             self.commit()?;
-            self.sync_public_mode(&desired.spec).await?;
+            self.sync_public_mode(&desired.spec);
         }
         if desired.admitted()
             && let Some(blocker) = self.blocker(desired)
@@ -862,7 +1222,10 @@ impl Supervisor
         {
             return Ok(false);
         }
-        let new_generation = desired.spec.generation != self.observed_generation;
+        let new_generation = self
+            .running_spec
+            .as_ref()
+            .is_none_or(|running| !same_runtime_spec(running, &desired.spec));
         let policy = RestartPolicy::try_from(desired.spec.restart_policy)
             .unwrap_or(RestartPolicy::Unspecified);
         let allowed = new_generation
@@ -927,7 +1290,11 @@ impl Supervisor
     {
         match self.prepare(&spec).await
         {
-            Ok(prepared) => self.prepared = Some(prepared),
+            Ok(prepared) =>
+            {
+                self.prepared = Some(prepared);
+                self.prepared_spec = Some(Arc::clone(&spec));
+            }
             Err(error) =>
             {
                 tracing::warn!(error = %error, "preparation before boot failed");
@@ -937,8 +1304,7 @@ impl Supervisor
                 return Ok(false);
             }
         }
-        self.boot(spec).await?;
-        Ok(true)
+        self.boot(spec).await
     }
 
     async fn step_rejected(&mut self, desired: &Desired) -> Result<bool, ReconcilerError>
@@ -949,7 +1315,8 @@ impl Supervisor
                 .await?;
             return Ok(true);
         }
-        if desired.spec.generation == self.observed_generation
+        if desired.rejection() == Some(self.reason.as_str())
+            && desired.spec.generation == self.observed_generation
         {
             return Ok(false);
         }
@@ -966,7 +1333,8 @@ impl Supervisor
 
     async fn step_deleting(&mut self, desired: &Desired) -> Result<bool, ReconcilerError>
     {
-        self.stop_sandbox_now().await;
+        self.public_modes.send_replace(None);
+        self.stop_sandbox_now().await?;
         self.release_resources(&desired.spec).await?;
         self.checkpoint("after-release").await;
         let deleted = InstanceStatus {
@@ -1025,6 +1393,10 @@ impl Supervisor
         self.handle = None;
         self.last_record = None;
         self.prepared = None;
+        self.prepared_spec = None;
+        self.running_spec = None;
+        self.legacy_spec = None;
+        self.recovery_pending = false;
         self.reason.clear();
     }
 
@@ -1037,14 +1409,14 @@ impl Supervisor
         {
             self.restart_count = 0;
         }
-        self.stop_sandbox_now().await;
+        self.stop_sandbox_now().await?;
         self.exit_was_clean = code == Some(0);
         self.enter_failed(describe_exit(code)).await
     }
 
     pub(crate) async fn fail(&mut self, reason: String) -> Result<(), ReconcilerError>
     {
-        self.stop_sandbox_now().await;
+        self.stop_sandbox_now().await?;
         self.exit_was_clean = false;
         self.enter_failed(reason).await
     }
@@ -1059,29 +1431,37 @@ impl Supervisor
         self.transition(Phase::Failed, reason).await
     }
 
-    async fn stop_sandbox_now(&mut self)
+    async fn stop_sandbox_now(&mut self) -> Result<(), ReconcilerError>
     {
         self.guest = None;
         self.connection = None;
         self.guest_ready = false;
-        if let Some(handle) = self.handle.clone()
+        if self.handle.is_none()
         {
-            if let Err(error) = self
+            self.handle = self
                 .inner
                 .parts
                 .sandbox
+                .recover(&self.id, self.last_record.as_ref())
+                .await?;
+            if self.handle.is_some()
+            {
+                self.commit()?;
+            }
+        }
+        if let Some(handle) = self.handle.clone()
+        {
+            self.inner
+                .parts
+                .sandbox
                 .shutdown(&handle, ShutdownMode::Force)
-                .await
-            {
-                tracing::warn!(error = %error, "force shutdown failed");
-            }
-            if let Err(error) = self.inner.parts.sandbox.destroy(&handle).await
-            {
-                tracing::warn!(error = %error, "destroying the sandbox failed");
-            }
+                .await?;
+            self.inner.parts.sandbox.destroy(&handle).await?;
             self.handle = None;
             self.sandbox_state = "destroyed".to_owned();
         }
+        self.recovery_pending = false;
+        Ok(())
     }
 
     async fn poll_exit(&mut self, force: bool) -> Option<Option<i32>>
@@ -1419,6 +1799,12 @@ impl Supervisor
         {
             return Ok(());
         };
+        if let Some(reason) = self.boot_blocker(&spec)?
+        {
+            self.fail(format!("configuration cancelled: {reason}"))
+                .await?;
+            return Ok(());
+        }
         let secrets = lock(&self.inner.secrets)
             .get(&self.id)
             .filter(|(generation, _)| *generation == spec.generation)
@@ -1591,11 +1977,12 @@ impl Supervisor
         }
     }
 
-    async fn sync_public_mode(&self, spec: &InstanceSpec) -> Result<(), ReconcilerError>
+    fn sync_public_mode(&self, spec: &InstanceSpec)
     {
-        if self.attachment.is_none()
+        if self.attachment.is_none() || matches!(self.phase, Phase::Deleting | Phase::Deleted)
         {
-            return Ok(());
+            self.public_modes.send_replace(None);
+            return;
         }
         let mode = match self.phase
         {
@@ -1610,12 +1997,9 @@ impl Supervisor
             }
             _ => network::PublicIpMode::Stopped,
         };
-        self.inner
-            .parts
-            .network
-            .set_public_mode(&self.id, mode)
-            .await?;
-        Ok(())
+        // Preparation may replace a binding while the lifecycle phase remains
+        // Stopped. Reapply the current mode even when its enum did not change.
+        self.public_modes.send_replace(Some(mode));
     }
 
     async fn take_snapshot(&mut self) -> Result<TakenSnapshot, ReconcilerError>
@@ -1635,78 +2019,181 @@ impl Supervisor
             .disks
             .first()
             .ok_or(ReconcilerError::MissingField("disk"))?;
-        let volume = volume_name(&self.id, &disk.name);
-        let guest = self
+        if let Some(reason) = self.boot_blocker(&spec)?
+        {
+            return Err(ReconcilerError::SnapshotRefused(reason));
+        }
+        let volume = crate::provision::resolve_disk_name(&self.inner, &self.id, &disk.name).await?;
+        let connection = self
             .guest
             .as_ref()
-            .filter(|guest| guest.connection().is_some())
+            .and_then(GuestChannel::connection)
             .ok_or_else(|| ReconcilerError::GuestNotConnected(self.id.clone()))?;
+        static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
+        let unique = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let request_id = format!("qs-{}-{timestamp:x}-{unique:x}", std::process::id());
+        let epoch = lock(&self.inner.leases).epoch(&self.id);
+        let until = Instant::now() + SNAPSHOT_FREEZE_TIMEOUT;
         self.snapshot_prepared = None;
-        let prepare = HostMessage {
-            body: Some(HostBody::PrepareSnapshot(PrepareSnapshot {})),
+        let authority = authority_lost(
+            Arc::clone(&self.inner),
+            self.id.clone(),
+            Arc::clone(&spec),
+            epoch,
+            self.desired.clone(),
+            Arc::clone(&self.poke),
+            false,
+        );
+        let result = tokio::select! {
+            result = self.snapshot_volume(&volume, &request_id, connection) => result,
+            error = authority => Err(error),
+            _ = sleep_until(until) => Err(ReconcilerError::Timeout("snapshot exceeded the guest freeze window".to_owned())),
         };
-        let sent = guest.send(&prepare).await;
-        let result = match sent
+        // A result and the timer can become ready in the same scheduler turn.
+        let result = if Instant::now() >= until
         {
-            Ok(()) =>
+            drop(result);
+            Err(ReconcilerError::Timeout(
+                "snapshot exceeded the guest freeze window".to_owned(),
+            ))
+        }
+        else if !self.lease_valid() || lock(&self.inner.leases).epoch(&self.id) != epoch
+        {
+            drop(result);
+            Err(ReconcilerError::SnapshotRefused(
+                "lease changed or expired during snapshot".to_owned(),
+            ))
+        }
+        else
+        {
+            result
+        };
+        let result = match self.boot_blocker(&spec)
+        {
+            Ok(None) => result,
+            Ok(Some(reason)) =>
             {
-                tracing::info!("sent PrepareSnapshot");
-                self.snapshot_volume(&volume).await
+                drop(result);
+                Err(ReconcilerError::SnapshotRefused(reason))
             }
-            Err(error) => Err(error),
+            Err(error) =>
+            {
+                drop(result);
+                Err(error)
+            }
         };
         let resume = HostMessage {
-            body: Some(HostBody::ResumeWrites(ResumeWrites {})),
+            body: Some(HostBody::ResumeWrites(ResumeWrites {
+                request_id: request_id.clone(),
+            })),
         };
         match self.guest.as_ref()
         {
-            Some(guest) => match guest.send(&resume).await
+            Some(guest) =>
             {
-                Ok(()) => tracing::info!("sent ResumeWrites"),
-                Err(error) => tracing::warn!(error = %error, "sending ResumeWrites failed"),
-            },
+                match tokio::time::timeout(Duration::from_millis(250), guest.send(&resume)).await
+                {
+                    Ok(Ok(())) => tracing::info!("sent ResumeWrites"),
+                    _ =>
+                    {
+                        guest.disconnect("snapshot resume could not be delivered promptly");
+                        self.connection = None;
+                    }
+                }
+            }
             None => tracing::warn!("guest channel closed before ResumeWrites"),
         }
-        let snapshot = result?;
+        if result.is_err()
+        {
+            if let Some(guest) = &self.guest
+            {
+                guest.disconnect("snapshot request ended without a valid snapshot");
+            }
+            self.connection = None;
+            self.snapshot_prepared = None;
+        }
+        let (snapshot, cleanup) = result?;
         Ok(TakenSnapshot {
             snapshot,
             volume,
             disk: disk.name.clone(),
-            lease_epoch: lock(&self.inner.leases).epoch(&self.id),
+            lease_epoch: epoch,
+            _cleanup: cleanup,
         })
     }
 
-    async fn snapshot_volume(&mut self, volume: &str) -> Result<VolumeInfo, ReconcilerError>
+    async fn snapshot_volume(
+        &mut self,
+        volume: &str,
+        request_id: &str,
+        connection: u64,
+    ) -> Result<(VolumeInfo, SnapshotCleanup), ReconcilerError>
     {
-        let until = Instant::now() + SNAPSHOT_PREPARE_TIMEOUT;
-        while self.snapshot_prepared.is_none() && Instant::now() < until
+        let prepare = HostMessage {
+            body: Some(HostBody::PrepareSnapshot(PrepareSnapshot {
+                request_id: request_id.to_owned(),
+            })),
+        };
+        self.guest
+            .as_ref()
+            .ok_or_else(|| ReconcilerError::GuestNotConnected(self.id.clone()))?
+            .send(&prepare)
+            .await?;
+        tracing::info!(request_id, "sent PrepareSnapshot");
+        loop
+        {
+            if self.guest.as_ref().and_then(GuestChannel::connection) != Some(connection)
+            {
+                return Err(ReconcilerError::GuestNotConnected(self.id.clone()));
+            }
+            if let Some(prepared) = self.snapshot_prepared.take()
+                && prepared.request_id == request_id
+            {
+                if !prepared.ok
+                {
+                    return Err(ReconcilerError::SnapshotRefused(prepared.error));
+                }
+                break;
+            }
+            let event = next_guest_event(&mut self.guest).await;
+            self.on_guest_event(event).await?;
+        }
+        self.checkpoint("after-snapshot-prepared").await;
+        let backend = Arc::clone(self.inner.parts.volumes.backend());
+        let volume = volume.to_owned();
+        let name = request_id.to_owned();
+        let mut work = tokio::spawn(async move {
+            let cleanup = SnapshotCleanup {
+                backend: Arc::clone(&backend),
+                name: name.clone(),
+            };
+            let snapshot = backend.snapshot(&volume, &name).await?;
+            Ok::<_, ReconcilerError>((snapshot, cleanup))
+        });
+        loop
         {
             tokio::select! {
-                event = next_guest_event(&mut self.guest) =>
-                {
+                result = &mut work => {
+                    let result = result?;
+                    if self.guest.as_ref().and_then(GuestChannel::connection) != Some(connection)
+                    {
+                        drop(result);
+                        return Err(ReconcilerError::GuestNotConnected(self.id.clone()));
+                    }
+                    return result;
+                },
+                event = next_guest_event(&mut self.guest) => {
                     self.on_guest_event(event).await?;
+                    if self.guest.as_ref().and_then(GuestChannel::connection) != Some(connection)
+                    {
+                        return Err(ReconcilerError::GuestNotConnected(self.id.clone()));
+                    }
                 }
-                _ = sleep_until(until) => {}
             }
-        }
-        match self.snapshot_prepared.take()
-        {
-            Some(prepared) if prepared.ok =>
-            {
-                let name = format!("{volume}-snap-{}", unix_now());
-                tracing::info!(snapshot = %name, "taking volume snapshot");
-                Ok(self
-                    .inner
-                    .parts
-                    .volumes
-                    .backend()
-                    .snapshot(volume, &name)
-                    .await?)
-            }
-            Some(prepared) => Err(ReconcilerError::SnapshotRefused(prepared.error)),
-            None => Err(ReconcilerError::Timeout(
-                "waiting for the guest to prepare the snapshot".to_owned(),
-            )),
         }
     }
 
@@ -1727,7 +2214,7 @@ impl Supervisor
         self.commit()?;
         self.inner.wake.notify_one();
         let desired = self.desired.borrow().spec.clone();
-        self.sync_public_mode(&desired).await?;
+        self.sync_public_mode(&desired);
         self.checkpoint(Lifecycle::phase_name(to)).await;
         Ok(())
     }
@@ -1773,10 +2260,18 @@ impl Supervisor
         {
             self.last_record = Some(handle.record().clone());
         }
-        let record = self.handle.as_ref().map(SandboxHandle::record);
+        let record = self.handle.as_ref().map(SandboxHandle::record).or_else(|| {
+            self.recovery_pending
+                .then_some(self.last_record.as_ref())
+                .flatten()
+        });
         let _guard = lock(&self.inner.write_lock);
         let lease = lock(&self.inner.leases).get(&self.id);
         let actual = ActualState {
+            applied_spec: self
+                .running_spec
+                .as_ref()
+                .map(|spec| normalized_spec(spec).encode_to_vec()),
             observed_generation: self.observed_generation,
             phase: Lifecycle::phase_name(self.phase).to_owned(),
             reason: self.reason.clone(),
@@ -1855,5 +2350,13 @@ impl Supervisor
         }
         #[cfg(not(test))]
         let _ = label;
+    }
+}
+
+impl Drop for Supervisor
+{
+    fn drop(&mut self)
+    {
+        self.public_mode_task.abort();
     }
 }

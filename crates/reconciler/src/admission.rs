@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use proto::v1::{ArtifactRef, InstanceSpec, Isolation, Resources};
 use sandbox::SandboxKind;
+use store::Store;
 use usage::Metrics;
 use volume::{PoolAlert, Volumes};
+
+use crate::reconciler::normalized_spec;
 
 const MAX_VOLUME_NAME_LEN: usize = 100;
 const MAX_DISK_NAME_LEN: usize = 64;
@@ -17,11 +21,41 @@ pub enum Verdict
     Rejected(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Decision
 {
     pub generation: u64,
     pub verdict: Verdict,
+    spec: Option<Arc<InstanceSpec>>,
+}
+
+impl Decision
+{
+    pub fn new(spec: &InstanceSpec, verdict: Verdict) -> Decision
+    {
+        Decision {
+            generation: spec.generation,
+            verdict,
+            spec: Some(Arc::new(normalized_spec(spec))),
+        }
+    }
+
+    /// Restored accounting without proof of which spec was admitted must be rechecked.
+    pub fn unverified(generation: u64, verdict: Verdict) -> Decision
+    {
+        Decision {
+            generation,
+            verdict,
+            spec: None,
+        }
+    }
+
+    pub fn matches_spec(&self, spec: &InstanceSpec) -> bool
+    {
+        self.spec
+            .as_deref()
+            .is_some_and(|admitted| *admitted == normalized_spec(spec))
+    }
 }
 
 /// Admission check of section 11: allocatable = capacity − reservation, no overcommit.
@@ -31,6 +65,7 @@ pub struct Admission
     kind: SandboxKind,
     snapshots_configured: bool,
     decisions: BTreeMap<String, Decision>,
+    actual_resources: BTreeMap<String, Resources>,
 }
 
 pub fn allocatable(capacity: &Resources, reservation: &Resources) -> Resources
@@ -55,6 +90,12 @@ pub fn spec_resources(spec: &InstanceSpec) -> Resources
 }
 
 pub fn volume_name(instance_id: &str, disk_name: &str) -> String
+{
+    volume::disk_volume_name(instance_id, disk_name)
+}
+
+/// The pre-ownership naming scheme, used only to locate existing disks safely.
+pub(crate) fn legacy_volume_name(instance_id: &str, disk_name: &str) -> String
 {
     let raw = format!("{instance_id}-{disk_name}");
     raw.chars()
@@ -139,7 +180,14 @@ impl Admission
             kind,
             snapshots_configured,
             decisions: BTreeMap::new(),
+            actual_resources: BTreeMap::new(),
         }
+    }
+
+    /// Resources remain committed until the previous sandbox is confirmed stopped.
+    pub fn set_actual_resources(&mut self, resources: BTreeMap<String, Resources>)
+    {
+        self.actual_resources = resources;
     }
 
     pub fn seed(&mut self, instance_id: &str, decision: Decision)
@@ -159,15 +207,25 @@ impl Admission
 
     pub fn committed(&self, excluding: Option<&str>) -> Resources
     {
-        self.decisions
-            .iter()
-            .filter(|(id, _)| Some(id.as_str()) != excluding)
-            .filter_map(|(_, decision)| match &decision.verdict
+        let mut reservations = self.actual_resources.clone();
+        for (id, decision) in &self.decisions
+        {
+            if let Verdict::Admitted(resources) = &decision.verdict
             {
-                Verdict::Admitted(resources) => Some(resources),
-                Verdict::Rejected(_) => None,
-            })
-            .fold(Resources::default(), |total, resources| Resources {
+                reservations
+                    .entry(id.clone())
+                    .and_modify(|actual| {
+                        actual.vcpus = actual.vcpus.max(resources.vcpus);
+                        actual.memory_mib = actual.memory_mib.max(resources.memory_mib);
+                        actual.disk_gib = actual.disk_gib.max(resources.disk_gib);
+                    })
+                    .or_insert(*resources);
+            }
+        }
+        reservations
+            .into_iter()
+            .filter(|(id, _)| Some(id.as_str()) != excluding)
+            .fold(Resources::default(), |total, (_, resources)| Resources {
                 vcpus: total.vcpus.saturating_add(resources.vcpus),
                 memory_mib: total.memory_mib.saturating_add(resources.memory_mib),
                 disk_gib: total.disk_gib.saturating_add(resources.disk_gib),
@@ -334,25 +392,23 @@ impl Admission
         is_new: bool,
         draining: bool,
         volumes: &Volumes,
+        store: &Store,
         metrics: &Metrics,
     ) -> Decision
     {
         if let Some(existing) = self.decisions.get(&spec.id)
-            && existing.generation == spec.generation
+            && existing.matches_spec(spec)
         {
             return existing.clone();
         }
         let verdict = match self
-            .evaluate(spec, is_new, draining, volumes, metrics)
+            .evaluate(spec, is_new, draining, volumes, store, metrics)
             .await
         {
             Ok(resources) => Verdict::Admitted(resources),
             Err(reason) => Verdict::Rejected(reason),
         };
-        let decision = Decision {
-            generation: spec.generation,
-            verdict,
-        };
+        let decision = Decision::new(spec, verdict);
         self.decisions.insert(spec.id.clone(), decision.clone());
         decision
     }
@@ -363,6 +419,7 @@ impl Admission
         is_new: bool,
         draining: bool,
         volumes: &Volumes,
+        store: &Store,
         metrics: &Metrics,
     ) -> Result<Resources, String>
     {
@@ -374,7 +431,10 @@ impl Admission
         let resources = self.check_resources(spec)?;
         for disk in &spec.disks
         {
-            let name = volume_name(&spec.id, &disk.name);
+            let name = store
+                .disk_binding(&spec.id, &disk.name)
+                .map_err(|error| format!("cannot resolve volume {:?}: {error}", disk.name))?
+                .unwrap_or_else(|| volume_name(&spec.id, &disk.name));
             let exists = volumes
                 .backend()
                 .get(&name)
@@ -405,7 +465,8 @@ impl Admission
 #[cfg(test)]
 mod tests
 {
-    use proto::v1::{DiskSpec, InstanceNetwork, SnapshotRef};
+    use proto::v1::{DiskSpec, InstanceNetwork, Lease, SnapshotRef};
+    use volume::FileVolume;
 
     use super::*;
 
@@ -484,21 +545,18 @@ mod tests
         let mut admission = admission(SandboxKind::Fake);
         admission.seed(
             "a",
-            Decision {
-                generation: 1,
-                verdict: Verdict::Admitted(Resources {
+            Decision::new(
+                &spec("a", 4, 4096, 10),
+                Verdict::Admitted(Resources {
                     vcpus: 4,
                     memory_mib: 4096,
                     disk_gib: 10,
                 }),
-            },
+            ),
         );
         admission.seed(
             "r",
-            Decision {
-                generation: 1,
-                verdict: Verdict::Rejected("no".to_owned()),
-            },
+            Decision::new(&spec("r", 1, 1, 1), Verdict::Rejected("no".to_owned())),
         );
         assert_eq!(
             admission
@@ -630,11 +688,297 @@ mod tests
         assert!(supports(SandboxKind::Fake, Isolation::Firecracker));
     }
 
+    #[tokio::test]
+    async fn same_generation_resource_changes_replace_the_reservation()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = Volumes::new(Arc::new(FileVolume::new(
+            dir.path().to_path_buf(),
+            100 * 1024 * 1024 * 1024,
+        )));
+        let store = Store::open_in_memory().unwrap();
+        let metrics = Metrics::new("admission-revision");
+        let mut admission = admission(SandboxKind::Fake);
+        let original = spec("a", 2, 2048, 10);
+        assert!(matches!(
+            admission
+                .decide(&original, true, false, &volumes, &store, &metrics)
+                .await
+                .verdict,
+            Verdict::Admitted(_)
+        ));
+
+        let changed = spec("a", 3, 4096, 20);
+        let decision = admission
+            .decide(&changed, false, false, &volumes, &store, &metrics)
+            .await;
+        assert_eq!(
+            decision.verdict,
+            Verdict::Admitted(spec_resources(&changed))
+        );
+        assert!(decision.matches_spec(&changed));
+        assert!(!decision.matches_spec(&original));
+        assert_eq!(admission.committed(None), spec_resources(&changed));
+        assert_eq!(
+            admission.check_resources(&spec("b", 6, 1, 1)).unwrap_err(),
+            "insufficient vcpus: requested 6, available 5"
+        );
+
+        let smaller = spec("a", 1, 1024, 5);
+        admission
+            .decide(&smaller, false, false, &volumes, &store, &metrics)
+            .await;
+        assert_eq!(admission.committed(None), spec_resources(&smaller));
+        assert!(admission.check_resources(&spec("b", 7, 7168, 95)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn same_generation_edits_are_validated_and_rejections_can_be_corrected()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = Volumes::new(Arc::new(FileVolume::new(
+            dir.path().to_path_buf(),
+            100 * 1024 * 1024 * 1024,
+        )));
+        let store = Store::open_in_memory().unwrap();
+        let metrics = Metrics::new("admission-revision");
+        let mut admission = admission(SandboxKind::Fake);
+        let original = spec("a", 1, 1024, 1);
+        admission
+            .decide(&original, true, false, &volumes, &store, &metrics)
+            .await;
+
+        let mut changed = original.clone();
+        changed.memory_mib = 8193;
+        let rejected = admission
+            .decide(&changed, false, false, &volumes, &store, &metrics)
+            .await;
+        assert!(matches!(
+            rejected.verdict,
+            Verdict::Rejected(reason) if reason.starts_with("insufficient memory")
+        ));
+        assert_eq!(admission.committed(None), Resources::default());
+
+        changed.memory_mib = 1024;
+        changed.network = Some(InstanceNetwork {
+            ports: vec![0],
+            ..Default::default()
+        });
+        let rejected = admission
+            .decide(&changed, false, false, &volumes, &store, &metrics)
+            .await;
+        assert!(matches!(
+            rejected.verdict,
+            Verdict::Rejected(reason) if reason.contains("invalid port 0")
+        ));
+
+        changed.network.as_mut().unwrap().ports = vec![25565];
+        let corrected = admission
+            .decide(&changed, false, false, &volumes, &store, &metrics)
+            .await;
+        assert_eq!(
+            corrected.verdict,
+            Verdict::Admitted(spec_resources(&changed))
+        );
+        assert_eq!(admission.committed(None), spec_resources(&changed));
+    }
+
+    #[tokio::test]
+    async fn restored_reservations_without_a_spec_identity_are_revalidated()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = Volumes::new(Arc::new(FileVolume::new(
+            dir.path().to_path_buf(),
+            100 * 1024 * 1024 * 1024,
+        )));
+        let store = Store::open_in_memory().unwrap();
+        let metrics = Metrics::new("admission-revision");
+        let mut admission = admission(SandboxKind::Fake);
+        let original = spec("a", 1, 1024, 1);
+        let restored = Decision::unverified(
+            original.generation,
+            Verdict::Admitted(spec_resources(&original)),
+        );
+        assert!(!restored.matches_spec(&original));
+        admission.seed(&original.id, restored);
+        assert_eq!(admission.committed(None), spec_resources(&original));
+
+        let changed = spec("a", 9, 1024, 1);
+        let decision = admission
+            .decide(&changed, false, false, &volumes, &store, &metrics)
+            .await;
+        assert!(matches!(
+            decision.verdict,
+            Verdict::Rejected(reason) if reason.starts_with("insufficient vcpus")
+        ));
+    }
+
+    #[tokio::test]
+    async fn shrinking_or_rejecting_a_spec_keeps_resources_until_the_sandbox_stops()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = Volumes::new(Arc::new(FileVolume::new(
+            dir.path().to_path_buf(),
+            100 * 1024 * 1024 * 1024,
+        )));
+        let store = Store::open_in_memory().unwrap();
+        let metrics = Metrics::new("admission-revision");
+        let mut admission = admission(SandboxKind::Fake);
+        let running = spec("a", 6, 6144, 60);
+        admission.seed(
+            &running.id,
+            Decision::new(&running, Verdict::Admitted(spec_resources(&running))),
+        );
+        admission.set_actual_resources(BTreeMap::from([(
+            running.id.clone(),
+            spec_resources(&running),
+        )]));
+
+        let smaller = spec("a", 1, 1024, 10);
+        let decision = admission
+            .decide(&smaller, false, false, &volumes, &store, &metrics)
+            .await;
+        assert_eq!(
+            decision.verdict,
+            Verdict::Admitted(spec_resources(&smaller))
+        );
+        assert_eq!(admission.committed(None), spec_resources(&running));
+        assert_eq!(
+            admission.check_resources(&spec("b", 3, 1, 1)).unwrap_err(),
+            "insufficient vcpus: requested 3, available 2"
+        );
+
+        let too_large = spec("a", 9, 1024, 10);
+        let decision = admission
+            .decide(&too_large, false, false, &volumes, &store, &metrics)
+            .await;
+        assert!(matches!(decision.verdict, Verdict::Rejected(_)));
+        assert_eq!(admission.committed(None), spec_resources(&running));
+        assert!(admission.check_resources(&spec("b", 3, 1, 1)).is_err());
+
+        admission.forget(&running.id);
+        assert_eq!(admission.committed(None), spec_resources(&running));
+        admission.set_actual_resources(BTreeMap::new());
+        assert_eq!(admission.committed(None), Resources::default());
+        assert!(admission.check_resources(&spec("b", 8, 8192, 100)).is_ok());
+    }
+
+    #[test]
+    fn overlapping_desired_and_actual_reservations_use_each_resource_maximum()
+    {
+        let mut admission = admission(SandboxKind::Fake);
+        let running = spec("a", 6, 2048, 60);
+        admission.set_actual_resources(BTreeMap::from([(
+            running.id.clone(),
+            spec_resources(&running),
+        )]));
+        let desired = spec("a", 2, 6144, 10);
+        admission.seed(
+            &desired.id,
+            Decision::new(&desired, Verdict::Admitted(spec_resources(&desired))),
+        );
+        assert_eq!(
+            admission.committed(None),
+            Resources {
+                vcpus: 6,
+                memory_mib: 6144,
+                disk_gib: 60,
+            }
+        );
+        assert_eq!(admission.committed(Some("a")), Resources::default());
+
+        admission.set_actual_resources(BTreeMap::new());
+        assert_eq!(admission.committed(None), spec_resources(&desired));
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_allows_existing_disks_under_their_persisted_binding()
+    {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = Volumes::new(Arc::new(FileVolume::new(
+            dir.path().to_path_buf(),
+            10 * GIB,
+        )));
+        let store = Store::open_in_memory().unwrap();
+        let metrics = Metrics::new("admission-legacy-disk");
+        let mut admission = admission(SandboxKind::Fake);
+        let existing = spec("a", 1, 1024, 9);
+        volumes
+            .backend()
+            .create("legacy-world", 9 * GIB)
+            .await
+            .unwrap();
+        store.claim_disk("a", "data", "legacy-world").unwrap();
+        assert_eq!(
+            volumes.pool_status().await.unwrap().alert,
+            PoolAlert::Critical
+        );
+
+        let decision = admission
+            .decide(&existing, false, false, &volumes, &store, &metrics)
+            .await;
+        assert_eq!(
+            decision.verdict,
+            Verdict::Admitted(spec_resources(&existing))
+        );
+
+        let fresh = spec("b", 1, 1024, 1);
+        let decision = admission
+            .decide(&fresh, true, false, &volumes, &store, &metrics)
+            .await;
+        assert!(matches!(
+            decision.verdict,
+            Verdict::Rejected(reason) if reason.starts_with("thin pool is 90.0% full")
+        ));
+    }
+
+    #[test]
+    fn decision_identity_compares_map_content_without_retaining_secret_values()
+    {
+        let mut original = spec("a", 1, 1024, 1);
+        original.env.insert("FIRST".to_owned(), "one".to_owned());
+        original.env.insert("SECOND".to_owned(), "two".to_owned());
+        original
+            .secrets
+            .insert("token".to_owned(), b"secret".to_vec());
+        original.lease = Some(Lease {
+            epoch: 1,
+            ttl_ms: 1000,
+        });
+        let decision = Decision::new(&original, Verdict::Admitted(spec_resources(&original)));
+        assert!(decision.spec.as_ref().unwrap().secrets["token"].is_empty());
+
+        let mut replay = original.clone();
+        replay.env.clear();
+        replay.env.insert("SECOND".to_owned(), "two".to_owned());
+        replay.env.insert("FIRST".to_owned(), "one".to_owned());
+        replay
+            .secrets
+            .insert("token".to_owned(), b"resent".to_vec());
+        assert!(decision.matches_spec(&replay));
+
+        replay.env.insert("FIRST".to_owned(), "changed".to_owned());
+        assert!(!decision.matches_spec(&replay));
+        replay = original.clone();
+        replay.lease.as_mut().unwrap().ttl_ms += 1;
+        assert!(!decision.matches_spec(&replay));
+        replay = original.clone();
+        replay.generation += 1;
+        assert!(!decision.matches_spec(&replay));
+        replay = original;
+        replay.secrets.insert("another".to_owned(), Vec::new());
+        assert!(!decision.matches_spec(&replay));
+    }
+
     #[test]
     fn volume_names_are_sanitized()
     {
-        assert_eq!(volume_name("srv-1", "data"), "srv-1-data");
-        assert_eq!(volume_name("srv-1", "my disk/x"), "srv-1-my-disk-x");
-        assert_eq!(volume_name("a", &"x".repeat(200)).len(), 100);
+        assert_eq!(legacy_volume_name("srv-1", "data"), "srv-1-data");
+        assert_eq!(legacy_volume_name("srv-1", "my disk/x"), "srv-1-my-disk-x");
+        assert_eq!(legacy_volume_name("a", &"x".repeat(200)).len(), 100);
+        assert_ne!(volume_name("a-b", "c"), volume_name("a", "b-c"));
+        assert_ne!(volume_name("srv-1", "my disk/x"), volume_name("srv-1", "my-disk-x"));
+        assert_eq!(volume_name("a", &"x".repeat(200)).len(), 67);
     }
 }

@@ -48,6 +48,7 @@ fn sample_actual() -> ActualState
         last_exit_unix: Some(1_700_000_000),
         lease_epoch: 7,
         lease_expires_unix_ms: Some(1_700_000_060_000),
+        applied_spec: Some(b"applied spec".to_vec()),
     }
 }
 
@@ -712,4 +713,141 @@ fn disk_inventory_is_durable_and_idempotent()
         store.instance_disks("instance-2").unwrap(),
         vec!["instance-2-data"]
     );
+}
+
+#[test]
+fn disk_bindings_are_exclusive_durable_and_not_reassigned()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ownership.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store.claim_disk("a-b", "c", "legacy-a-b-c").unwrap();
+        store.claim_disk("a-b", "c", "legacy-a-b-c").unwrap();
+        assert!(matches!(
+            store.claim_disk("a", "b-c", "legacy-a-b-c"),
+            Err(StoreError::DiskOwnership { .. })
+        ));
+        assert!(matches!(
+            store.claim_disk("a-b", "different", "legacy-a-b-c"),
+            Err(StoreError::DiskOwnership { .. })
+        ));
+        assert!(matches!(
+            store.claim_disk("a-b", "c", "other-volume"),
+            Err(StoreError::DiskOwnership { .. })
+        ));
+        assert!(store.remember_disk("a", "legacy-a-b-c").is_err());
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.disk_binding("a-b", "c").unwrap().as_deref(),
+        Some("legacy-a-b-c")
+    );
+    store.assert_disk_owner("a-b", "legacy-a-b-c").unwrap();
+    assert!(store.assert_disk_owner("a", "legacy-a-b-c").is_err());
+    store.forget_disk("a-b", "legacy-a-b-c").unwrap();
+    assert_eq!(store.disk_binding("a-b", "c").unwrap(), None);
+    store.claim_disk("a", "b-c", "legacy-a-b-c").unwrap();
+}
+
+#[test]
+fn preexisting_ambiguous_legacy_inventory_is_preserved_and_refused()
+{
+    let store = Store::open_in_memory().unwrap();
+    // This was legal under the old schema and must never be silently resolved
+    // in favor of whichever instance happens to be processed first.
+    store.connection().execute(
+        "INSERT INTO instance_disks (instance_id, name) VALUES ('a', 'shared'), ('b', 'shared')", [],
+    ).unwrap();
+    for owner in ["a", "b"]
+    {
+        assert!(store.claim_disk(owner, "data", "shared").is_err());
+        assert!(store.assert_disk_owner(owner, "shared").is_err());
+        assert!(store.forget_disk(owner, "shared").is_err());
+        assert_eq!(store.instance_disks(owner).unwrap(), ["shared"]);
+    }
+}
+
+#[test]
+fn desired_spec_and_lease_commit_together_without_replay_extension()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lease.db");
+    {
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .put_desired_with_lease("a", 1, b"one", Some((7, 100)))
+                .unwrap(),
+            PutOutcome::Inserted
+        );
+        assert_eq!(
+            store
+                .put_desired_with_lease("a", 1, b"one", Some((7, 200)))
+                .unwrap(),
+            PutOutcome::Unchanged
+        );
+    }
+    let store = Store::open(&path).unwrap();
+    let row = store.get_instance("a").unwrap().unwrap();
+    assert_eq!(
+        (row.spec, row.lease_epoch, row.lease_expires_unix_ms),
+        (b"one".to_vec(), 7, Some(100))
+    );
+    store
+        .put_desired_with_lease("a", 2, b"two", Some((6, 300)))
+        .unwrap();
+    let row = store.get_instance("a").unwrap().unwrap();
+    assert_eq!((row.lease_epoch, row.lease_expires_unix_ms), (7, Some(100)));
+    store
+        .put_desired_with_lease("a", 2, b"changed", Some((7, 50)))
+        .unwrap();
+    assert_eq!(
+        store
+            .get_instance("a")
+            .unwrap()
+            .unwrap()
+            .lease_expires_unix_ms,
+        Some(50)
+    );
+}
+
+#[test]
+fn ownership_migration_preserves_ambiguous_legacy_rows()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATIONS[0]).unwrap();
+        connection.execute_batch(MIGRATIONS[1]).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.execute_batch(
+            "INSERT INTO instance_disks (instance_id, name) VALUES ('a', 'shared'), ('b', 'shared'); \
+             INSERT INTO instances (id, generation, spec, updated_at_unix) VALUES ('a', 1, x'01', 0);",
+        ).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(store.get_instance("a").unwrap().unwrap().applied_spec, None);
+    assert_eq!(store.instance_disks("a").unwrap(), ["shared"]);
+    assert_eq!(store.instance_disks("b").unwrap(), ["shared"]);
+    assert!(store.claim_disk("a", "data", "shared").is_err());
+    assert!(store.claim_disk("b", "data", "shared").is_err());
+}
+
+#[test]
+fn quarantined_name_cannot_be_claimed_after_its_old_specs_are_removed()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quarantine.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .quarantine_disk("shared", "two legacy disk identities match")
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert!(store.claim_disk("new", "data", "shared").is_err());
+    assert!(store.remember_disk("new", "shared").is_err());
 }

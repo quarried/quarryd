@@ -51,6 +51,9 @@ enum SnapshotState
     {
         deadline: Instant,
     },
+    // The console save was cancelled, but its untagged completion line must be
+    // drained before another request can safely wait for a save completion.
+    SavingCancelled,
     Freezing,
     Prepared
     {
@@ -117,6 +120,7 @@ struct Agent
     log_limiter: RateLimiter,
     dropped_lines: u64,
     snapshot: SnapshotState,
+    snapshot_request: Option<String>,
     resume_after_freeze: bool,
     frozen: bool,
     stopping: Option<Stopping>,
@@ -172,6 +176,7 @@ pub async fn run(settings: Settings) -> i32
         log_limiter: RateLimiter::new(LOG_BURST, LOG_LINES_PER_SECOND),
         dropped_lines: 0,
         snapshot: SnapshotState::Idle,
+        snapshot_request: None,
         resume_after_freeze: false,
         frozen: false,
         stopping: None,
@@ -260,6 +265,7 @@ impl Agent
                 if self.is_current(id)
                 {
                     self.connection = None;
+                    self.cancel_snapshot();
                     log!("lost the host connection; reconnecting");
                     channel::spawn_connector(self.settings.transport.clone(), self.events.clone());
                 }
@@ -396,14 +402,14 @@ impl Agent
                 }
                 None
             }
-            HostBody::PrepareSnapshot(_) =>
+            HostBody::PrepareSnapshot(prepare) =>
             {
-                self.on_prepare_snapshot();
+                self.on_prepare_snapshot(prepare.request_id);
                 None
             }
-            HostBody::ResumeWrites(_) =>
+            HostBody::ResumeWrites(resume) =>
             {
-                self.on_resume_writes();
+                self.on_resume_writes(&resume.request_id);
                 None
             }
             HostBody::Shutdown(shutdown) =>
@@ -537,6 +543,21 @@ impl Agent
     fn on_server_line(&mut self, line: String)
     {
         let now = Instant::now();
+        if output::is_save_complete(&line)
+        {
+            match self.snapshot
+            {
+                SnapshotState::Saving { .. } => self.start_freeze(),
+                SnapshotState::SavingCancelled =>
+                {
+                    self.snapshot = SnapshotState::Idle;
+                    self.snapshot_request = None;
+                    self.send_stop_when_idle();
+                }
+                _ =>
+                {}
+            }
+        }
         let (consumed, step) = self.prober.observe(&line, now.into_std());
         self.apply_probe_step(step);
         if consumed
@@ -559,10 +580,6 @@ impl Agent
                 self.send_ready();
                 self.next_health = Some(now);
             }
-        }
-        if matches!(self.snapshot, SnapshotState::Saving { .. }) && output::is_save_complete(&line)
-        {
-            self.start_freeze();
         }
         self.forward_log(line, now);
     }
@@ -716,8 +733,10 @@ impl Agent
             {
                 log!("the world save did not finish within {SAVE_TIMEOUT:?}");
                 self.command("save-on");
-                self.snapshot = SnapshotState::Idle;
+                self.snapshot = SnapshotState::SavingCancelled;
+                let request_id = self.snapshot_request.take().unwrap_or_default();
                 self.reply_prepared(
+                    &request_id,
                     false,
                     "timed out after 30 s waiting for the world save to finish",
                 );
@@ -745,15 +764,16 @@ impl Agent
         }
     }
 
-    fn reply_prepared(&self, ok: bool, error: &str)
+    fn reply_prepared(&self, request_id: &str, ok: bool, error: &str)
     {
         self.send(GuestBody::SnapshotPrepared(SnapshotPrepared {
             ok,
             error: output::single_line(error, MAX_ERROR_BYTES),
+            request_id: request_id.to_owned(),
         }));
     }
 
-    fn on_prepare_snapshot(&mut self)
+    fn on_prepare_snapshot(&mut self, request_id: String)
     {
         let refusal = if self.stopping.is_some()
         {
@@ -773,7 +793,7 @@ impl Agent
         };
         if let Some(refusal) = refusal
         {
-            self.reply_prepared(false, refusal);
+            self.reply_prepared(&request_id, false, refusal);
             return;
         }
         match self.snapshot
@@ -781,18 +801,31 @@ impl Agent
             SnapshotState::Idle =>
             {
                 log!("preparing a snapshot: flushing the world");
+                self.snapshot_request = Some(request_id);
                 self.command("save-off");
                 self.command("save-all flush");
                 self.snapshot = SnapshotState::Saving {
                     deadline: Instant::now() + SAVE_TIMEOUT,
                 };
             }
-            SnapshotState::Saving { .. } | SnapshotState::Freezing =>
+            SnapshotState::Saving { .. }
+            | SnapshotState::SavingCancelled
+            | SnapshotState::Freezing =>
             {
-                log!("snapshot preparation is already in progress");
+                self.reply_prepared(
+                    &request_id,
+                    false,
+                    "snapshot preparation is already in progress",
+                );
             }
-            SnapshotState::Prepared { .. } => self.reply_prepared(true, ""),
-            SnapshotState::Thawing => self.reply_prepared(false, "writes are being resumed"),
+            SnapshotState::Prepared { .. } =>
+            {
+                self.reply_prepared(&request_id, false, "a snapshot is already prepared")
+            }
+            SnapshotState::Thawing =>
+            {
+                self.reply_prepared(&request_id, false, "writes are being resumed")
+            }
         }
     }
 
@@ -812,6 +845,7 @@ impl Agent
 
     fn on_frozen(&mut self, result: Result<FreezeOutcome, String>)
     {
+        let request_id = self.snapshot_request.clone().unwrap_or_default();
         let release_at = Instant::now() + FREEZE_LIMIT;
         let prepared = match result
         {
@@ -839,6 +873,7 @@ impl Agent
                 log!("snapshot preparation failed: {error}");
                 self.command("save-on");
                 self.snapshot = SnapshotState::Idle;
+                self.snapshot_request = None;
                 Err(error)
             }
         };
@@ -846,10 +881,14 @@ impl Agent
         {
             Ok(()) if self.stopping.is_some() =>
             {
-                self.reply_prepared(false, "the server is shutting down")
+                self.reply_prepared(&request_id, false, "the server is shutting down")
             }
-            Ok(()) => self.reply_prepared(true, ""),
-            Err(error) => self.reply_prepared(false, &error),
+            Ok(()) if self.resume_after_freeze =>
+            {
+                self.reply_prepared(&request_id, false, "snapshot preparation was cancelled")
+            }
+            Ok(()) => self.reply_prepared(&request_id, true, ""),
+            Err(error) => self.reply_prepared(&request_id, false, &error),
         }
         if self.stopping.is_some() || self.resume_after_freeze
         {
@@ -858,19 +897,28 @@ impl Agent
         self.send_stop_when_idle();
     }
 
-    fn on_resume_writes(&mut self)
+    fn on_resume_writes(&mut self, request_id: &str)
+    {
+        if self.snapshot_request.as_deref() == Some(request_id)
+        {
+            self.cancel_snapshot();
+        }
+    }
+
+    fn cancel_snapshot(&mut self)
     {
         match self.snapshot
         {
             SnapshotState::Prepared { .. } => self.release_writes(),
             SnapshotState::Saving { .. } =>
             {
-                log!("ResumeWrites arrived before the snapshot was prepared; resuming");
+                log!("snapshot cancelled before the save completed; resuming writes");
                 self.command("save-on");
-                self.snapshot = SnapshotState::Idle;
+                self.snapshot = SnapshotState::SavingCancelled;
+                self.snapshot_request = None;
             }
             SnapshotState::Freezing => self.resume_after_freeze = true,
-            SnapshotState::Idle | SnapshotState::Thawing =>
+            SnapshotState::Idle | SnapshotState::SavingCancelled | SnapshotState::Thawing =>
             {}
         }
     }
@@ -895,6 +943,7 @@ impl Agent
             {
                 self.command("save-on");
                 self.snapshot = SnapshotState::Idle;
+                self.snapshot_request = None;
                 self.send_stop_when_idle();
             }
             _ =>
@@ -915,6 +964,7 @@ impl Agent
         }
         self.command("save-on");
         self.snapshot = SnapshotState::Idle;
+        self.snapshot_request = None;
         self.send_stop_when_idle();
     }
 
@@ -951,11 +1001,12 @@ impl Agent
         }
         match self.snapshot
         {
-            SnapshotState::Saving { .. } =>
+            SnapshotState::Saving { .. } | SnapshotState::SavingCancelled =>
             {
                 self.command("save-on");
                 self.snapshot = SnapshotState::Idle;
-                self.reply_prepared(false, "the server is shutting down");
+                let request_id = self.snapshot_request.take().unwrap_or_default();
+                self.reply_prepared(&request_id, false, "the server is shutting down");
             }
             SnapshotState::Prepared { .. } => self.release_writes(),
             SnapshotState::Idle | SnapshotState::Freezing | SnapshotState::Thawing =>

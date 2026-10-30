@@ -1,4 +1,3 @@
-use std::io;
 use std::path::Path;
 
 use crate::UsageError;
@@ -75,19 +74,8 @@ pub async fn read_cgroup(path: &Path) -> Result<CgroupStats, UsageError>
 {
     let cpu_stat = read_file(&path.join("cpu.stat")).await?;
     let memory_current = read_file(&path.join("memory.current")).await?;
-    let io_stat_path = path.join("io.stat");
-    let (io_read_bytes, io_write_bytes) = match tokio::fs::read_to_string(&io_stat_path).await
-    {
-        Ok(text) => parse_io_stat(&text),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (0, 0),
-        Err(source) =>
-        {
-            return Err(UsageError::Io {
-                path: io_stat_path,
-                source,
-            });
-        }
-    };
+    let io_stat = read_file(&path.join("io.stat")).await?;
+    let (io_read_bytes, io_write_bytes) = parse_io_stat(&io_stat);
     Ok(CgroupStats {
         cpu_usage_usec: parse_cpu_stat(&cpu_stat)?,
         memory_current_bytes: parse_memory_current(&memory_current)?,
@@ -182,11 +170,26 @@ mod tests
     }
 
     #[tokio::test]
-    async fn missing_io_stat_reads_as_zero()
+    async fn missing_io_stat_is_an_error()
     {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("cpu.stat"), CPU_STAT).unwrap();
         std::fs::write(directory.path().join("memory.current"), "4096\n").unwrap();
+        assert!(matches!(
+            read_cgroup(directory.path()).await,
+            Err(UsageError::Io { path, source })
+                if path == directory.path().join("io.stat")
+                    && source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_io_stat_reads_as_zero()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("cpu.stat"), CPU_STAT).unwrap();
+        std::fs::write(directory.path().join("memory.current"), "4096\n").unwrap();
+        std::fs::write(directory.path().join("io.stat"), "").unwrap();
         let stats = read_cgroup(directory.path()).await.unwrap();
         assert_eq!(stats.io_read_bytes, 0);
         assert_eq!(stats.io_write_bytes, 0);
@@ -205,7 +208,7 @@ mod tests
     }
 
     #[tokio::test]
-    #[ignore = "needs Linux cgroup v2 mounted at /sys/fs/cgroup with memory.current (container or delegated cgroup)"]
+    #[ignore = "needs Linux cgroup v2 mounted at /sys/fs/cgroup with memory.current and io.stat (container or delegated cgroup)"]
     async fn reads_real_cgroup_v2()
     {
         let stats = read_cgroup(Path::new("/sys/fs/cgroup")).await.unwrap();

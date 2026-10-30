@@ -181,7 +181,7 @@ async fn a_full_thin_pool_rejects_new_volumes()
     }
     let pool = node.volumes.pool_status().await.unwrap();
     assert_eq!(pool.alert, volume::PoolAlert::Critical);
-    assert!(fixture.volume_files() == vec!["adm-pool-data.img".to_owned()]);
+    assert!(fixture.volume_files() == vec![format!("{}.img", volume_name("adm-pool", "data"))]);
     for id in ["adm-pool", "adm-pool2"]
     {
         node.handle.delete_instance(id).await.unwrap();
@@ -228,4 +228,126 @@ async fn a_rejected_new_generation_stops_the_old_one()
     node.handle.delete_instance(id).await.unwrap();
     node.wait_gone(id, &fixture.store).await;
     node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_generation_resource_edits_are_readmitted_and_repaired()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let id = "adm-same-generation";
+    let mut spec = fixture.spec(id, "normal");
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    node.wait_running(id, 1).await;
+    let pid = fixture.last_pid(id).unwrap();
+
+    spec.memory_mib = 64_000;
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    let rejected = node.wait_phase(id, Phase::Rejected).await;
+    assert_eq!(rejected.observed_generation, 1);
+    assert!(
+        rejected.reason.contains("insufficient memory"),
+        "{rejected:?}"
+    );
+    assert!(!process_alive(pid));
+
+    spec.memory_mib = 1024;
+    node.handle.put_instance(spec).await.unwrap();
+    node.wait_running(id, 1).await;
+    assert_eq!(fixture.starts(id), 2);
+    assert_eq!(
+        node.handle
+            .heartbeat()
+            .load
+            .unwrap()
+            .committed
+            .unwrap()
+            .memory_mib,
+        1024
+    );
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    node.stop().await;
+}
+
+async fn public_rejection_keeps_generation_fence(id: &str, occupied: bool)
+{
+    use network::Network;
+    use prost::Message;
+
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    node.network
+        .configure_public(&network::PublicIpv4Config {
+            pool: vec!["192.0.2.51".to_owned(), "192.0.2.52".to_owned()],
+            uplink_interface: "eth0".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    if occupied
+    {
+        let mut owner = fixture.spec("public-owner", "normal");
+        owner.network.as_mut().unwrap().public_ipv4 = "192.0.2.52".to_owned();
+        node.handle.put_instance(owner).await.unwrap();
+        node.wait_running("public-owner", 1).await;
+    }
+    let mut original = fixture.spec(id, "normal");
+    original.network.as_mut().unwrap().public_ipv4 = "192.0.2.51".to_owned();
+    node.handle.put_instance(original.clone()).await.unwrap();
+    node.wait_running(id, 1).await;
+    let pid = fixture.last_pid(id).unwrap();
+    let mut updated = original.clone();
+    updated.generation = 2;
+    updated.network.as_mut().unwrap().public_ipv4 = if occupied
+    {
+        "192.0.2.52".to_owned()
+    }
+    else
+    {
+        "198.51.100.99".to_owned()
+    };
+    node.handle.put_instance(updated.clone()).await.unwrap();
+    let rejected = node.wait_phase(id, Phase::Rejected).await;
+    assert_eq!(rejected.observed_generation, 2);
+    assert!(!process_alive(pid));
+    let row = fixture.store.get_instance(id).unwrap().unwrap();
+    assert_eq!(row.generation, 2);
+    assert_eq!(InstanceSpec::decode(row.spec.as_slice()).unwrap(), updated);
+    node.handle.put_instance(original.clone()).await.unwrap();
+    assert_eq!(
+        fixture.store.get_instance(id).unwrap().unwrap().generation,
+        2
+    );
+    node.stop().await;
+
+    let node = fixture.start().await;
+    node.wait_phase(id, Phase::Rejected).await;
+    node.handle.put_instance(original).await.unwrap();
+    sleep_ms(600).await;
+    assert_eq!(node.status(id).unwrap().observed_generation, 2);
+    assert_eq!(phase_of(&node.status(id).unwrap()), Phase::Rejected);
+    assert_eq!(fixture.starts(id), 1);
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    if occupied
+    {
+        node.handle.delete_instance("public-owner").await.unwrap();
+        node.wait_gone("public-owner", &fixture.store).await;
+    }
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_public_address_update_persists_and_stops_the_previous_generation()
+{
+    public_rejection_keeps_generation_fence("adm-public-invalid", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn occupied_public_address_update_persists_and_stops_the_previous_generation()
+{
+    public_rejection_keeps_generation_fence("adm-public-occupied", true).await;
 }

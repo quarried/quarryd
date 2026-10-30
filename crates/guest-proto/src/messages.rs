@@ -98,6 +98,9 @@ pub struct SnapshotPrepared
     /// Failure detail when `ok` is false, at most 1024 bytes on one line.
     #[prost(string, tag = "2")]
     pub error: String,
+    /// Identifies the exact freeze attempt; old guests leave this empty.
+    #[prost(string, tag = "3")]
+    pub request_id: String,
 }
 
 /// Message sent by quarryd to the guest agent.
@@ -186,11 +189,21 @@ pub struct ConsoleCommand
 
 /// Flush the world and freeze writes; answered with [`SnapshotPrepared`].
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct PrepareSnapshot {}
+pub struct PrepareSnapshot
+{
+    /// Unique nonempty identifier for this freeze attempt.
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+}
 
 /// Resume world writes after a volume snapshot.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct ResumeWrites {}
+pub struct ResumeWrites
+{
+    /// Resume only the matching freeze attempt, never a later snapshot.
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+}
 
 /// Stop the server gracefully; answered with [`ShutdownComplete`].
 #[derive(Clone, PartialEq, Eq, prost::Message)]

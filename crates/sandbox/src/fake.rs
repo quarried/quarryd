@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,8 +17,9 @@ use crate::error::io;
 use crate::shell::{join, path_text, quote, writer_argv};
 use crate::unit::{self, blocking};
 use crate::{
-    AGENT_TRANSPORT_ENV, Sandbox, SandboxError, SandboxHandle, SandboxKind, SandboxRecord,
-    SandboxSpec, SandboxState, ShutdownMode, persist_record, read_persisted_record, validate_spec,
+    AGENT_TRANSPORT_ENV, LaunchControl, Sandbox, SandboxError, SandboxHandle, SandboxKind, SandboxRecord,
+    SandboxSpec, SandboxState, ShutdownMode, persist_record, read_persisted_record,
+    validate_instance_id, validate_spec,
 };
 
 const PROCESS_FILE: &str = "process.json";
@@ -120,17 +122,32 @@ async fn process_info(pid: u32) -> Option<ProcessInfo>
 
 async fn is_alive(identity: &ProcessIdentity) -> bool
 {
+    let Some(marker) = &identity.marker
+    else
+    {
+        return false;
+    };
     match process_info(identity.pid).await
     {
         Some(info) =>
         {
-            !info.zombie
-                && identity
-                    .marker
-                    .as_ref()
-                    .is_none_or(|marker| *marker == info.start)
+            !info.zombie && *marker == info.start
         }
         None => false,
+    }
+}
+
+fn pid_exists(pid: u32) -> Result<bool, SandboxError>
+{
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| SandboxError::InvalidSpec("invalid fake sandbox pid".into()))?;
+    match nix::sys::signal::kill(Pid::from_raw(pid), None)
+    {
+        Ok(()) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -214,18 +231,48 @@ fn wrapper_script(paths: &FakePaths, writer: Option<&[String]>) -> Result<String
 pub struct FakeSandbox
 {
     config: FakeConfig,
+    fail_adopt: AtomicBool,
+    fail_recover: AtomicBool,
+    launch_delay: std::sync::Mutex<Option<Duration>>,
+    #[cfg(test)]
+    launch_barriers: std::sync::Mutex<Option<(std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>)>>,
 }
 
 impl FakeSandbox
 {
     pub fn new(config: FakeConfig) -> Self
     {
-        Self { config }
+        Self {
+            config,
+            fail_adopt: AtomicBool::new(false),
+            fail_recover: AtomicBool::new(false),
+            launch_delay: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            launch_barriers: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn config(&self) -> &FakeConfig
     {
         &self.config
+    }
+
+    /// Inject an uncertain adoption result without stopping the fake process.
+    pub fn fail_next_adopt(&self)
+    {
+        self.fail_adopt.store(true, Ordering::SeqCst);
+    }
+
+    /// Inject an uncertain recovery result without changing process ownership.
+    pub fn fail_next_recover(&self)
+    {
+        self.fail_recover.store(true, Ordering::SeqCst);
+    }
+
+    /// Delay the next new-process launch to exercise cancellation during setup.
+    pub fn delay_next_launch(&self, delay: Duration)
+    {
+        *self.launch_delay.lock().unwrap() = Some(delay);
     }
 
     fn paths(&self, instance_id: &str) -> FakePaths
@@ -252,19 +299,25 @@ impl FakeSandbox
             .and_then(|text| text.trim().parse().ok())
     }
 
-    fn base_record(&self, spec: &SandboxSpec, paths: &FakePaths, pid: u32) -> SandboxRecord
+    fn base_record(
+        &self,
+        instance_id: &str,
+        generation: u64,
+        paths: &FakePaths,
+        pid: Option<u32>,
+    ) -> SandboxRecord
     {
         SandboxRecord {
-            instance_id: spec.instance_id.clone(),
-            generation: spec.generation,
+            instance_id: instance_id.to_owned(),
+            generation,
             kind: SandboxKind::Fake,
-            unit_name: format!("fake:{}", spec.instance_id),
+            unit_name: format!("fake:{instance_id}"),
             api_socket: None,
             guest_socket: paths.guest_socket.clone(),
             console_path: paths.console.clone(),
             cgroup_path: None,
             metrics_path: None,
-            pid: Some(pid),
+            pid,
             runtime_dir: paths.dir.clone(),
         }
     }
@@ -366,6 +419,18 @@ impl FakeSandbox
         Ok(())
     }
 
+    async fn abort(&self, identity: &ProcessIdentity, error: SandboxError) -> SandboxError
+    {
+        match self.force_stop(identity).await
+        {
+            Ok(()) => error,
+            Err(cleanup) => SandboxError::LaunchCleanup {
+                launch: Box::new(error),
+                cleanup: Box::new(cleanup),
+            },
+        }
+    }
+
     fn check_kind(record: &SandboxRecord) -> Result<(), SandboxError>
     {
         if record.kind == SandboxKind::Fake
@@ -395,22 +460,40 @@ impl Sandbox for FakeSandbox
         self.paths(instance_id).guest_socket
     }
 
-    async fn launch(&self, spec: &SandboxSpec) -> Result<SandboxHandle, SandboxError>
+    async fn launch_controlled(
+        &self,
+        spec: &SandboxSpec,
+        control: LaunchControl,
+    ) -> Result<SandboxHandle, SandboxError>
     {
+        control.check()?;
         validate_spec(spec)?;
         let paths = self.paths(&spec.instance_id);
         if let Some(identity) = read_identity(&paths)
             && is_alive(&identity).await
         {
+            if let Err(error) = control.check()
+            {
+                return Err(self.abort(&identity, error).await);
+            }
             let mut record = read_persisted_record(&paths.dir, &spec.instance_id)
-                .unwrap_or_else(|| self.base_record(spec, &paths, identity.pid));
+                .unwrap_or_else(|| {
+                    self.base_record(
+                        &spec.instance_id,
+                        spec.generation,
+                        &paths,
+                        Some(identity.pid),
+                    )
+                });
             record.pid = Some(identity.pid);
             return Ok(SandboxHandle::new(record));
         }
         let prepared = paths.clone();
         let ring = self.config.console_writer.is_some();
         let max_bytes = spec.console_max_bytes;
+        let prepare_control = control.clone();
         blocking(move || {
+            prepare_control.check()?;
             fs::create_dir_all(&prepared.dir)
                 .map_err(io(format!("create {}", prepared.dir.display())))?;
             for stale in [
@@ -433,23 +516,66 @@ impl Sandbox for FakeSandbox
             }
         })
         .await?;
+        let delay = self.launch_delay.lock().unwrap().take();
+        if let Some(delay) = delay
+        {
+            let started = Instant::now();
+            loop
+            {
+                control.check()?;
+                let remaining = delay.saturating_sub(started.elapsed());
+                if remaining.is_zero()
+                {
+                    break;
+                }
+                sleep(remaining.min(Duration::from_millis(10))).await;
+            }
+        }
+        control.check()?;
         let identity = self.spawn(spec, &paths).await?;
-        let record = self.base_record(spec, &paths, identity.pid);
+        #[cfg(test)]
+        {
+            let barriers = self.launch_barriers.lock().unwrap().take();
+            if let Some((started, release)) = barriers
+            {
+                started.wait().await;
+                release.wait().await;
+            }
+        }
+        let authority = control.check();
+        let record = self.base_record(
+            &spec.instance_id,
+            spec.generation,
+            &paths,
+            Some(identity.pid),
+        );
         let process_file = paths.process.clone();
         let to_persist = record.clone();
-        blocking(move || {
-            let bytes = serde_json::to_vec(&identity)?;
+        let to_persist_identity = identity.clone();
+        let persisted = blocking(move || {
+            let bytes = serde_json::to_vec(&to_persist_identity)?;
             fs::write(&process_file, bytes)
                 .map_err(io(format!("write {}", process_file.display())))?;
             persist_record(&to_persist)
         })
-        .await?;
+        .await;
+        if let Err(error) = persisted.and(authority).and_then(|()| control.check())
+        {
+            return Err(self.abort(&identity, error).await);
+        }
         Ok(SandboxHandle::new(record))
     }
 
     async fn adopt(&self, record: &SandboxRecord) -> Result<Option<SandboxHandle>, SandboxError>
     {
         Self::check_kind(record)?;
+        if self.fail_adopt.swap(false, Ordering::SeqCst)
+        {
+            return Err(SandboxError::Io {
+                context: "fake sandbox adoption".into(),
+                source: std::io::Error::other("injected adoption failure"),
+            });
+        }
         let paths = Self::record_paths(record);
         let Some(identity) = read_identity(&paths)
         else
@@ -463,6 +589,99 @@ impl Sandbox for FakeSandbox
         let mut record = record.clone();
         record.pid = Some(identity.pid);
         Ok(Some(SandboxHandle::new(record)))
+    }
+
+    async fn recover(
+        &self,
+        instance_id: &str,
+        record: Option<&SandboxRecord>,
+    ) -> Result<Option<SandboxHandle>, SandboxError>
+    {
+        validate_instance_id(instance_id)?;
+        if self.fail_recover.swap(false, Ordering::SeqCst)
+        {
+            return Err(SandboxError::Io {
+                context: "fake sandbox recovery".into(),
+                source: std::io::Error::other("injected recovery failure"),
+            });
+        }
+        if let Some(record) = record
+        {
+            Self::check_kind(record)?;
+            if record.instance_id != instance_id
+            {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "sandbox recovery record does not belong to instance {instance_id}"
+                )));
+            }
+        }
+        let paths = record
+            .map(Self::record_paths)
+            .unwrap_or_else(|| self.paths(instance_id));
+        if !paths
+            .dir
+            .try_exists()
+            .map_err(io(format!("stat {}", paths.dir.display())))?
+        {
+            return if record
+                .and_then(|record| record.pid)
+                .map(pid_exists)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                Err(SandboxError::Io {
+                    context: format!("recover fake sandbox {instance_id}"),
+                    source: std::io::Error::other("process identity directory is missing"),
+                })
+            }
+            else
+            {
+                Ok(None)
+            };
+        }
+        let identity: Option<ProcessIdentity> = match fs::read(&paths.process)
+        {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io(format!("read {}", paths.process.display()))(error)),
+        };
+        let missing_identity_pid = if let Some(identity) = &identity
+        {
+            identity.marker.is_none().then_some(identity.pid)
+        }
+        else if let Some(pid) = record.and_then(|record| record.pid)
+        {
+            Some(pid)
+        }
+        else
+        {
+            match fs::read_to_string(&paths.pid)
+            {
+                Ok(pid) => Some(pid.trim().parse().map_err(|_| {
+                    SandboxError::InvalidSpec("invalid fake sandbox pid file".into())
+                })?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io(format!("read {}", paths.pid.display()))(error)),
+            }
+        };
+        if read_exit_code(&paths).is_none()
+            && missing_identity_pid
+                .map(pid_exists)
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err(SandboxError::Io {
+                context: format!("recover fake sandbox {instance_id}"),
+                source: std::io::Error::other("durable process start identity is missing"),
+            });
+        }
+        let mut recovered = record
+            .cloned()
+            .or_else(|| read_persisted_record(&paths.dir, instance_id))
+            .unwrap_or_else(|| self.base_record(instance_id, 0, &paths, None));
+        Self::check_kind(&recovered)?;
+        recovered.pid = identity.map(|identity| identity.pid);
+        Ok(Some(SandboxHandle::new(recovered)))
     }
 
     async fn shutdown(&self, handle: &SandboxHandle, mode: ShutdownMode)
@@ -690,6 +909,118 @@ mod tests
     }
 
     #[tokio::test]
+    async fn recover_without_a_committed_record_keeps_process_identity()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = sandbox(directory.path(), TERM_EXITS_7);
+        let handle = sandbox.launch(&sample_spec("recovering")).await.unwrap();
+        let paths = FakeSandbox::record_paths(handle.record());
+        fs::remove_file(paths.dir.join(crate::RECORD_FILE)).unwrap();
+
+        let restarted = self::sandbox(directory.path(), TERM_EXITS_7);
+        let recovered = restarted.recover("recovering", None).await.unwrap().unwrap();
+        assert_eq!(recovered.record().pid, handle.record().pid);
+        assert_eq!(recovered.record().runtime_dir, handle.record().runtime_dir);
+        assert_eq!(
+            restarted.status(&recovered).await.unwrap(),
+            SandboxState::Running
+        );
+        restarted.destroy(&recovered).await.unwrap();
+        assert!(restarted.recover("recovering", None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_rejects_missing_or_corrupt_process_identity()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = sandbox(directory.path(), TERM_EXITS_7);
+        let handle = sandbox.launch(&sample_spec("uncertain")).await.unwrap();
+        let paths = FakeSandbox::record_paths(handle.record());
+        let identity = fs::read(&paths.process).unwrap();
+        fs::remove_file(&paths.process).unwrap();
+        assert!(sandbox.recover("uncertain", None).await.is_err());
+        fs::write(&paths.process, b"broken").unwrap();
+        assert!(
+            sandbox.recover("uncertain", Some(handle.record())).await.is_err()
+        );
+        fs::write(&paths.process, identity).unwrap();
+        assert_eq!(
+            sandbox.status(&handle).await.unwrap(),
+            SandboxState::Running
+        );
+        sandbox.destroy(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_record_finalization_stops_the_launched_process()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = sandbox(directory.path(), TERM_EXITS_7);
+        let paths = sandbox.paths("finalization");
+        fs::create_dir_all(paths.dir.join(format!("{}.tmp", crate::RECORD_FILE))).unwrap();
+
+        assert!(sandbox.launch(&sample_spec("finalization")).await.is_err());
+        let identity = read_identity(&paths).unwrap();
+        assert!(!is_alive(&identity).await);
+        let recovered = sandbox
+            .recover("finalization", None)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.destroy(&recovered).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_launch_does_not_spawn_a_process()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = sandbox(directory.path(), TERM_EXITS_7);
+        let control = LaunchControl::default();
+        control.cancel();
+        assert!(matches!(
+            sandbox.launch_controlled(&sample_spec("cancelled"), control).await,
+            Err(SandboxError::LaunchCancelled)
+        ));
+        assert!(!sandbox.paths("cancelled").dir.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_spawn_waits_for_cleanup_before_returning()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = std::sync::Arc::new(sandbox(directory.path(), TERM_EXITS_7));
+        let started = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        *sandbox.launch_barriers.lock().unwrap() = Some((started.clone(), release.clone()));
+        let control = LaunchControl::default();
+        let worker_control = control.clone();
+        let worker_sandbox = sandbox.clone();
+        let worker = tokio::spawn(async move {
+            worker_sandbox
+                .launch_controlled(&sample_spec("revoked"), worker_control)
+                .await
+        });
+        started.wait().await;
+        control.cancel();
+        release.wait().await;
+        assert!(matches!(worker.await.unwrap(), Err(SandboxError::LaunchCancelled)));
+        let identity = read_identity(&sandbox.paths("revoked")).unwrap();
+        assert!(!is_alive(&identity).await);
+        let recovered = sandbox.recover("revoked", None).await.unwrap().unwrap();
+        sandbox.destroy(&recovered).await.unwrap();
+    }
+
+    #[test]
+    fn fake_guest_socket_uses_the_process_credentials()
+    {
+        let sandbox = sandbox(Path::new("/unused"), "exit 0");
+        assert_eq!(
+            sandbox.guest_socket_owner(200_000, 200_000),
+            (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw())
+        );
+    }
+
+    #[tokio::test]
     async fn adopt_returns_none_for_a_dead_or_replaced_process()
     {
         let directory = tempfile::tempdir().unwrap();
@@ -709,6 +1040,12 @@ mod tests
         identity.marker = Some("a different start time".into());
         fs::write(&paths.process, serde_json::to_vec(&identity).unwrap()).unwrap();
         assert!(sleeper.adopt(running.record()).await.unwrap().is_none());
+        let recovered = sleeper.recover("replaced", None).await.unwrap().unwrap();
+        sleeper
+            .shutdown(&recovered, ShutdownMode::Force)
+            .await
+            .unwrap();
+        assert!(is_alive(&original).await);
         fs::write(&paths.process, serde_json::to_vec(&original).unwrap()).unwrap();
         assert!(sleeper.adopt(running.record()).await.unwrap().is_some());
         sleeper.destroy(&running).await.unwrap();

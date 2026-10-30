@@ -11,6 +11,7 @@ use nix::sys::statfs::{NSFS_MAGIC, statfs};
 use crate::error::NetworkError;
 
 const THREAD_NETNS: &str = "/proc/thread-self/ns/net";
+const HOST_MOUNTNS: &str = "/proc/1/ns/mnt";
 
 fn errno_error(context: String, errno: Errno) -> NetworkError
 {
@@ -23,9 +24,9 @@ where
     F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
 {
     let netns_path = netns_path.to_path_buf();
+    let netns = open(&netns_path)?;
     let context = format!("running inside network namespace {}", netns_path.display());
     on_dedicated_thread(context, move || {
-        let netns = open(&netns_path)?;
         setns(&netns, CloneFlags::CLONE_NEWNET).map_err(|e| {
             errno_error(
                 format!("entering network namespace {}", netns_path.display()),
@@ -39,15 +40,21 @@ where
 
 pub(crate) fn open(netns_path: &Path) -> Result<File, NetworkError>
 {
-    File::open(netns_path).map_err(|e| {
-        NetworkError::io(
-            format!("opening network namespace {}", netns_path.display()),
-            e,
-        )
+    let netns_path = netns_path.to_path_buf();
+    let context = format!("opening network namespace {}", netns_path.display());
+    on_host_mount_thread(context.clone(), move || {
+        File::open(&netns_path).map_err(|e| NetworkError::io(context, e))
     })
 }
 
 pub(crate) fn exists(netns_path: &Path) -> Result<bool, NetworkError>
+{
+    let netns_path = netns_path.to_path_buf();
+    let context = format!("inspecting network namespace {}", netns_path.display());
+    on_host_mount_thread(context, move || exists_here(&netns_path))
+}
+
+fn exists_here(netns_path: &Path) -> Result<bool, NetworkError>
 {
     match statfs(netns_path)
     {
@@ -62,7 +69,18 @@ pub(crate) fn exists(netns_path: &Path) -> Result<bool, NetworkError>
 
 pub(crate) async fn create(netns_path: &Path) -> Result<(), NetworkError>
 {
-    if exists(netns_path)?
+    let netns_path = netns_path.to_path_buf();
+    let context = format!("creating network namespace {}", netns_path.display());
+    on_dedicated_thread(context, move || {
+        enter_host_mount_namespace()?;
+        create_here(&netns_path)
+    })
+    .await
+}
+
+fn create_here(netns_path: &Path) -> Result<(), NetworkError>
+{
+    if exists_here(netns_path)?
     {
         return Ok(());
     }
@@ -85,26 +103,23 @@ pub(crate) async fn create(netns_path: &Path) -> Result<(), NetworkError>
         .map_err(|e| {
             NetworkError::io(format!("creating mount point {}", netns_path.display()), e)
         })?;
-    let target = netns_path.to_path_buf();
-    let context = format!("creating network namespace {}", target.display());
-    let created = on_dedicated_thread(context, move || {
+    let created = (|| {
         unshare(CloneFlags::CLONE_NEWNET)
             .map_err(|e| errno_error("unsharing the network namespace".to_string(), e))?;
         mount(
             Some(THREAD_NETNS),
-            &target,
+            netns_path,
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
         )
         .map_err(|e| {
             errno_error(
-                format!("bind-mounting the namespace onto {}", target.display()),
+                format!("bind-mounting the namespace onto {}", netns_path.display()),
                 e,
             )
         })
-    })
-    .await;
+    })();
     if created.is_err()
     {
         remove_mount_point(netns_path)?;
@@ -113,6 +128,13 @@ pub(crate) async fn create(netns_path: &Path) -> Result<(), NetworkError>
 }
 
 pub(crate) fn remove(netns_path: &Path) -> Result<(), NetworkError>
+{
+    let netns_path = netns_path.to_path_buf();
+    let context = format!("removing network namespace {}", netns_path.display());
+    on_host_mount_thread(context, move || remove_here(&netns_path))
+}
+
+fn remove_here(netns_path: &Path) -> Result<(), NetworkError>
 {
     match umount2(netns_path, MntFlags::MNT_DETACH)
     {
@@ -189,21 +211,154 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
 {
-    let panicked = |context: &str| {
-        NetworkError::io(
-            context.to_string(),
-            std::io::Error::other("worker thread panicked"),
-        )
-    };
     let blocking_context = context.clone();
-    tokio::task::spawn_blocking(move || {
-        std::thread::Builder::new()
-            .name("quarry-netns".to_string())
-            .spawn(work)
-            .map_err(|e| NetworkError::io(blocking_context.clone(), e))?
-            .join()
-            .map_err(|_| panicked(&blocking_context))?
+    tokio::task::spawn_blocking(move || dedicated_thread(blocking_context, work))
+        .await
+        .map_err(|_| worker_panicked(context))?
+}
+
+fn dedicated_thread<T, F>(context: String, work: F) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
+{
+    // Never run setns on a Tokio worker, including its reusable blocking pool.
+    // A fresh OS thread exits after the operation, also on errors or panics.
+    std::thread::Builder::new()
+        .name("quarry-netns".to_string())
+        .spawn(work)
+        .map_err(|e| NetworkError::io(context.clone(), e))?
+        .join()
+        .map_err(|_| worker_panicked(context))?
+}
+
+fn worker_panicked(context: String) -> NetworkError
+{
+    NetworkError::io(context, std::io::Error::other("worker thread panicked"))
+}
+
+fn on_host_mount_thread<T, F>(context: String, work: F) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
+{
+    dedicated_thread(context, move || {
+        enter_host_mount_namespace()?;
+        work()
     })
-    .await
-    .map_err(|_| panicked(&context))?
+}
+
+fn enter_host_mount_namespace() -> Result<(), NetworkError>
+{
+    // systemd's filesystem protections prevent mounts made by quarryd from
+    // propagating to the independently launched VM units. Persist and look up
+    // namespace mounts in PID 1's mount namespace instead. CLONE_FS must be
+    // unshared first: Rust threads otherwise share the root/cwd with callers,
+    // and Linux refuses mount setns while those attributes are shared.
+    let host = File::open(HOST_MOUNTNS)
+        .map_err(|e| NetworkError::io("opening the host mount namespace".to_string(), e))?;
+    unshare(CloneFlags::CLONE_FS)
+        .map_err(|e| errno_error("unsharing filesystem attributes".to_string(), e))?;
+    setns(&host, CloneFlags::CLONE_NEWNS)
+        .map_err(|e| errno_error("entering the host mount namespace".to_string(), e))
+}
+
+#[cfg(test)]
+mod tests
+{
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    const THREAD_MOUNTNS: &str = "/proc/thread-self/ns/mnt";
+
+    struct NamespaceCleanup(PathBuf);
+
+    impl Drop for NamespaceCleanup
+    {
+        fn drop(&mut self)
+        {
+            let _ = remove(&self.0);
+        }
+    }
+
+    fn isolate_mounts() -> Result<PathBuf, NetworkError>
+    {
+        unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
+            .map_err(|e| errno_error("isolating test mounts".to_string(), e))?;
+        // Stronger than systemd's slave propagation: host-side changes cannot
+        // reach this worker, so open/exists must also use the host's view.
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| errno_error("isolating test mount propagation".to_string(), e))?;
+        Ok(fs::read_link(THREAD_MOUNTNS).unwrap())
+    }
+
+    #[tokio::test]
+    #[ignore = "needs root with CAP_SYS_ADMIN and CAP_SYS_CHROOT in PID 1's mount namespace on Linux"]
+    async fn namespace_mounts_survive_private_service_mount_namespaces()
+    {
+        let original_mount = fs::read_link(THREAD_MOUNTNS).unwrap();
+        let original_network = fs::read_link(THREAD_NETNS).unwrap();
+        assert_eq!(original_mount, fs::read_link(HOST_MOUNTNS).unwrap());
+        let path = PathBuf::from(format!(
+            "/run/netns/quarry-mount-test-{}",
+            std::process::id()
+        ));
+        assert!(!path.exists(), "test namespace already exists");
+        let _cleanup = NamespaceCleanup(path.clone());
+
+        let target = path.clone();
+        let inode =
+            on_dedicated_thread("test isolated namespace creation".to_string(), move || {
+                let private_mount = isolate_mounts()?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(create(&target))?;
+                assert_eq!(fs::read_link(THREAD_MOUNTNS).unwrap(), private_mount);
+                assert!(!exists_here(&target)?);
+                assert!(exists(&target)?);
+                let inode = open(&target)?.metadata().unwrap().ino();
+                runtime.block_on(create(&target))?;
+                assert_eq!(open(&target)?.metadata().unwrap().ino(), inode);
+                assert!(
+                    runtime
+                        .block_on(create(&target.join("invalid-child")))
+                        .is_err()
+                );
+                assert_eq!(fs::read_link(THREAD_MOUNTNS).unwrap(), private_mount);
+                Ok(inode)
+            })
+            .await
+            .unwrap();
+
+        // The creating service and its private mount namespace are now gone.
+        assert!(exists_here(&path).unwrap());
+        assert_eq!(File::open(&path).unwrap().metadata().unwrap().ino(), inode);
+        assert_eq!(fs::read_link(THREAD_MOUNTNS).unwrap(), original_mount);
+        assert_eq!(fs::read_link(THREAD_NETNS).unwrap(), original_network);
+
+        let target = path.clone();
+        on_dedicated_thread("test isolated namespace removal".to_string(), move || {
+            let private_mount = isolate_mounts()?;
+            remove(&target)?;
+            remove(&target)?;
+            assert!(!exists(&target)?);
+            assert_eq!(fs::read_link(THREAD_MOUNTNS).unwrap(), private_mount);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read_link(THREAD_MOUNTNS).unwrap(), original_mount);
+        assert_eq!(fs::read_link(THREAD_NETNS).unwrap(), original_network);
+    }
 }

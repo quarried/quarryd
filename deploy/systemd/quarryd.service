@@ -24,7 +24,8 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictRealtime=yes
 LockPersonality=yes
-ReadWritePaths=/var/lib/quarryd /run /srv/jailer /usr/local/bin /dev/net/tun /sys/fs/cgroup
+# LVM writes metadata archives/backups under /etc/lvm and locks under /run.
+ReadWritePaths=/var/lib/quarryd /run /etc/lvm /srv/jailer /usr/local/bin /dev/net/tun /sys/fs/cgroup
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_KILL CAP_SYS_PTRACE CAP_NET_RAW
 AmbientCapabilities=
 StandardOutput=journal

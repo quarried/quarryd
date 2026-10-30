@@ -83,22 +83,20 @@ impl Volumes
 
     pub async fn ensure(&self, name: &str, size_bytes: u64) -> Result<VolumeInfo, VolumeError>
     {
-        if let Some(existing) = self.backend.get(name).await?
+        if self.backend.get(name).await?.is_none()
         {
-            return Ok(existing);
+            self.admit().await?;
         }
-        self.admit().await?;
         self.backend.create(name, size_bytes).await
     }
 
     pub async fn ensure_blank(&self, name: &str, size_bytes: u64)
     -> Result<VolumeInfo, VolumeError>
     {
-        if let Some(existing) = self.backend.get(name).await?
+        if self.backend.get(name).await?.is_none()
         {
-            return Ok(existing);
+            self.admit().await?;
         }
-        self.admit().await?;
         self.backend.create_blank(name, size_bytes).await
     }
 

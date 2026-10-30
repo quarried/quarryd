@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
-use volume::{LvmThin, SnapshotStore, Volume, VolumeKind};
+use volume::{LvmThin, SnapshotStore, Volume, VolumeError, VolumeKind, Volumes};
 
 const MIB: u64 = 1024 * 1024;
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
@@ -42,6 +42,85 @@ fn write_at(path: &Path, offset: u64, data: &[u8])
 fn has_ext4_magic(path: &Path) -> bool
 {
     read_at(path, EXT4_MAGIC_OFFSET, 2) == [0x53, 0xef]
+}
+
+async fn command(program: &str, args: &[&str]) -> String
+{
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{program}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs root and an LVM thin pool named by QUARRY_TEST_VG / QUARRY_TEST_THIN_POOL"]
+async fn ensure_recovers_interrupted_create_and_reactivates_existing_volumes()
+{
+    let lvm = Arc::new(backend());
+    let volumes = Volumes::new(lvm.clone());
+    let name = unique("pending-v2");
+    let pool = format!("{}/{}", lvm.volume_group(), lvm.thin_pool());
+    command("lvcreate", &[
+        "--yes", "--virtualsize", "64m", "--thinpool", &pool,
+        "--name", &name, "--activate", "y", "--addtag", "quarry_mkfs_pending_v2",
+    ]).await;
+    let created = volumes.ensure(&name, 64 * MIB).await.unwrap();
+    assert!(has_ext4_magic(&created.path));
+    let qualified = format!("{}/{}", lvm.volume_group(), name);
+    let tags = command("lvs", &["--noheadings", "-o", "lv_tags", &qualified]).await;
+    assert!(!tags.contains("quarry_mkfs_pending"));
+    command("lvchange", &["--activate", "n", &qualified]).await;
+    assert_eq!(volumes.ensure(&name, 64 * MIB).await.unwrap(), created);
+    assert!(has_ext4_magic(&created.path));
+
+    let blank_name = unique("inactive-blank");
+    let blank = lvm.create_blank(&blank_name, 16 * MIB).await.unwrap();
+    command("lvchange", &["--activate", "n", &format!("{}/{}", lvm.volume_group(), blank_name)]).await;
+    assert_eq!(volumes.ensure_blank(&blank_name, 16 * MIB).await.unwrap(), blank);
+    assert!(!has_ext4_magic(&blank.path));
+    lvm.delete(&blank_name).await.unwrap();
+    lvm.delete(&name).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs root and an LVM thin pool named by QUARRY_TEST_VG / QUARRY_TEST_THIN_POOL"]
+async fn legacy_pending_recovery_preserves_worlds_and_refuses_unrecognized_data()
+{
+    let lvm = Arc::new(backend());
+    let volumes = Volumes::new(lvm.clone());
+    let name = unique("legacy-world");
+    let world = lvm.create(&name, 64 * MIB).await.unwrap();
+    let marker = b"existing world must survive recovery";
+    write_at(&world.path, 32 * MIB, marker);
+    let path = world.path.to_string_lossy();
+    let uuid = command("blkid", &["-p", "-o", "value", "-s", "UUID", "--", &path]).await;
+    let qualified = format!("{}/{}", lvm.volume_group(), name);
+    command("lvchange", &["--addtag", "quarry_mkfs_pending", "--addtag", "quarry_mkfs_pending_v2", &qualified]).await;
+    volumes.ensure(&name, 64 * MIB).await.unwrap();
+    assert_eq!(command("blkid", &["-p", "-o", "value", "-s", "UUID", "--", &path]).await, uuid);
+    assert_eq!(read_at(&world.path, 32 * MIB, marker.len()), marker);
+    assert!(!command("lvs", &["--noheadings", "-o", "lv_tags", &qualified]).await.contains("quarry_mkfs_pending"));
+
+    let unknown_name = unique("legacy-unknown");
+    let unknown = lvm.create_blank(&unknown_name, 16 * MIB).await.unwrap();
+    write_at(&unknown.path, unknown.size_bytes - 1, &[1]);
+    command("lvchange", &["--addtag", "quarry_mkfs_pending", &format!("{}/{}", lvm.volume_group(), unknown_name)]).await;
+    assert!(matches!(volumes.ensure(&unknown_name, 16 * MIB).await, Err(VolumeError::Integrity { .. })));
+    assert_eq!(read_at(&unknown.path, unknown.size_bytes - 1, 1), [1]);
+
+    let blank_name = unique("legacy-blank");
+    let blank = lvm.create_blank(&blank_name, 16 * MIB).await.unwrap();
+    command("lvchange", &["--addtag", "quarry_mkfs_pending", &format!("{}/{}", lvm.volume_group(), blank_name)]).await;
+    volumes.ensure(&blank_name, 16 * MIB).await.unwrap();
+    assert!(has_ext4_magic(&blank.path));
+    for name in [&name, &unknown_name, &blank_name]
+    {
+        lvm.delete(name).await.unwrap();
+    }
 }
 
 #[tokio::test]
