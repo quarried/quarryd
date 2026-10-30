@@ -95,7 +95,7 @@ pub fn decode_host(bytes: &[u8]) -> Result<HostMessage, GuestProtoError>
     if let Some(HostBody::Configure(configure)) = &mut message.body
         && configure.server_command.is_empty()
     {
-        configure.server_command = server::resolve_command(configure.memory_mib, &configure.env);
+        configure.server_command = server::resolve_command(&configure.env);
         return decode_host_message(&message.encode_to_vec());
     }
     decode_host_message(bytes)
@@ -258,20 +258,10 @@ mod tests
     }
 
     #[test]
-    fn an_empty_server_command_falls_back_to_java()
+    fn an_empty_server_command_falls_back_to_the_server_binary()
     {
         let decoded = decode_host(&configure(Vec::new(), HashMap::new())).unwrap();
-        assert_eq!(
-            command_of(decoded),
-            vec![
-                "java",
-                "-Xms1536M",
-                "-Xmx1536M",
-                "-jar",
-                "server.jar",
-                "nogui"
-            ]
-        );
+        assert_eq!(command_of(decoded), vec![guest_proto::SERVER_BINARY_PATH]);
     }
 
     #[test]

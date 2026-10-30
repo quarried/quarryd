@@ -312,7 +312,7 @@ mod tests
     #[test]
     fn resident_memory_is_read_from_proc_status()
     {
-        let status = "Name:\tjava\nVmPeak:\t 9000 kB\nVmRSS:\t  204800 kB\nThreads:\t40\n";
+        let status = "Name:\tquarry-server\nVmPeak:\t 9000 kB\nVmRSS:\t  204800 kB\nThreads:\t40\n";
         assert_eq!(vm_rss_bytes(status), Some(204_800 * 1024));
         assert_eq!(vm_rss_bytes("Name:\tkthreadd\n"), None);
         assert_eq!(vm_rss_bytes("VmRSS:\tlots kB\n"), None);

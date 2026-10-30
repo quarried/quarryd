@@ -382,6 +382,7 @@ impl Agent
         match server::spawn(
             &configure.server_command,
             &configure.env,
+            configure.memory_mib,
             &dir.path,
             self.events.clone(),
         )
@@ -401,10 +402,13 @@ impl Agent
             }
             Err(error) =>
             {
-                log!(
-                    "cannot start the server {:?}: {error}",
-                    configure.server_command.first()
-                );
+                log!("cannot start the server: {error}");
+                self.send(GuestBody::Log(Log {
+                    line: output::single_line(
+                        &format!("quarry-guest-agent: cannot start the server: {error}"),
+                        guest_proto::MAX_LOG_LINE_BYTES,
+                    ),
+                }));
                 Some(EXIT_FAILURE)
             }
         }

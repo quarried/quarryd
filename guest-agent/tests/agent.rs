@@ -19,6 +19,7 @@ const FAKE_SERVER: &str = r#"#!/bin/sh
 echo "Starting minecraft server version 1.21.4"
 echo "pid $$"
 echo "secrets ${QUARRY_SECRETS_DIR:-none}"
+echo "memory ${QUARRY_MEMORY_MIB:-none}"
 printf 'color \033[31mred\033[0m end\n'
 echo "Done (0.1s)! For help, type \"help\""
 while IFS= read -r line; do
@@ -46,6 +47,7 @@ struct Harness
     listener: Option<UnixListener>,
     agent: Child,
     stderr: Arc<Mutex<String>>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Harness
@@ -73,7 +75,7 @@ impl Harness
         let stderr = Arc::new(Mutex::new(String::new()));
         let mut pipe = agent.stderr.take().unwrap();
         let sink = stderr.clone();
-        tokio::spawn(async move {
+        let stderr_reader = tokio::spawn(async move {
             let mut buffer = [0u8; 4096];
             while let Ok(read) = pipe.read(&mut buffer).await
             {
@@ -92,6 +94,7 @@ impl Harness
             listener: Some(listener),
             agent,
             stderr,
+            stderr_reader: Some(stderr_reader),
         }
     }
 
@@ -141,11 +144,18 @@ impl Harness
 
     async fn exit_code(&mut self) -> Option<i32>
     {
-        timeout(WAIT, self.agent.wait())
+        let status = timeout(WAIT, self.agent.wait())
             .await
             .expect("the agent did not exit")
-            .unwrap()
-            .code()
+            .unwrap();
+        if let Some(reader) = self.stderr_reader.take()
+        {
+            timeout(WAIT, reader)
+                .await
+                .expect("agent stderr stayed open")
+                .unwrap();
+        }
+        status.code()
     }
 
     fn stderr(&self) -> String
@@ -285,6 +295,7 @@ async fn configure_starts_the_server_and_reports_ready_logs_and_health()
     let logs = host.logs();
     assert!(logs.contains(&"Starting minecraft server version 1.21.4".to_owned()));
     assert!(logs.contains(&"color red end".to_owned()));
+    assert!(logs.contains(&"memory 1024".to_owned()));
     assert!(logs.contains(&"Done (0.1s)! For help, type \"help\"".to_owned()));
     for probe_reply in [
         "There are 3",
@@ -463,6 +474,28 @@ async fn an_empty_server_command_runs_the_env_command()
     }
     host.send(configure).await;
     assert_eq!(host.ready().await, "1.21.4");
+}
+
+#[tokio::test]
+async fn a_missing_default_server_binary_fails_cleanly()
+{
+    assert!(
+        !Path::new(guest_proto::SERVER_BINARY_PATH).exists(),
+        "this test expects no server binary at {} on the test host",
+        guest_proto::SERVER_BINARY_PATH
+    );
+    let mut harness = Harness::start();
+    let mut host = harness.accept().await;
+    let mut configure = harness.configure(&[], &[]);
+    if let HostBody::Configure(configure) = &mut configure
+    {
+        configure.server_command.clear();
+    }
+    host.send(configure).await;
+    let line = host.log_containing("cannot start the server").await;
+    assert!(line.contains(guest_proto::SERVER_BINARY_PATH), "{line}");
+    assert_eq!(harness.exit_code().await, Some(1));
+    assert!(harness.stderr().contains(guest_proto::SERVER_BINARY_PATH));
 }
 
 fn mode(path: &Path) -> u32

@@ -31,3 +31,6 @@ pub const TRANSPORT_ENV: &str = "QUARRY_AGENT_TRANSPORT";
 
 /// Path of the guest agent binary inside guest images.
 pub const GUEST_AGENT_PATH: &str = "/usr/local/bin/quarry-guest-agent";
+
+/// Path of the server binary the guest agent starts when no server command is configured.
+pub const SERVER_BINARY_PATH: &str = "/usr/local/bin/quarry-server";

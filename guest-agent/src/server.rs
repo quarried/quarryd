@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use guest_proto::MAX_LOG_LINE_BYTES;
+use guest_proto::{MAX_LOG_LINE_BYTES, SERVER_BINARY_PATH};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -17,6 +18,7 @@ use crate::secrets::SECRETS_DIR_ENV;
 
 pub const DATA_DIR: &str = "/data";
 pub const SERVER_COMMAND_ENV: &str = "QUARRY_SERVER_COMMAND";
+pub const MEMORY_MIB_ENV: &str = "QUARRY_MEMORY_MIB";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const COMMAND_QUEUE: usize = 64;
 const OUTPUT_DRAIN: Duration = Duration::from_secs(1);
@@ -53,21 +55,35 @@ impl Server
     }
 }
 
-pub fn resolve_command(memory_mib: u64, env: &HashMap<String, String>) -> Vec<String>
+pub fn resolve_command(env: &HashMap<String, String>) -> Vec<String>
 {
-    if let Some(script) = env.get(SERVER_COMMAND_ENV)
+    match env.get(SERVER_COMMAND_ENV)
     {
-        return vec!["/bin/sh".to_owned(), "-c".to_owned(), script.clone()];
+        Some(script) => vec!["/bin/sh".to_owned(), "-c".to_owned(), script.clone()],
+        None => vec![SERVER_BINARY_PATH.to_owned()],
     }
-    let heap = (memory_mib.saturating_mul(3) / 4).max(1);
-    vec![
-        "java".to_owned(),
-        format!("-Xms{heap}M"),
-        format!("-Xmx{heap}M"),
-        "-jar".to_owned(),
-        "server.jar".to_owned(),
-        "nogui".to_owned(),
-    ]
+}
+
+fn check_executable(program: &str) -> io::Result<()>
+{
+    if !program.contains('/')
+    {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(program).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("server binary {program} is not available: {error}"),
+        )
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("server binary {program} is not an executable file"),
+        ));
+    }
+    Ok(())
 }
 
 fn working_dir() -> PathBuf
@@ -83,6 +99,7 @@ fn working_dir() -> PathBuf
 pub fn spawn(
     argv: &[String],
     env: &HashMap<String, String>,
+    memory_mib: u64,
     secrets_dir: &Path,
     events: mpsc::Sender<Event>,
 ) -> io::Result<Server>
@@ -90,11 +107,13 @@ pub fn spawn(
     let (program, arguments) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty server command"))?;
+    check_executable(program)?;
     let mut command = Command::new(program);
     command
         .args(arguments)
         .envs(env)
         .env(SECRETS_DIR_ENV, secrets_dir)
+        .env(MEMORY_MIB_ENV, memory_mib.to_string())
         .current_dir(working_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -264,20 +283,9 @@ mod tests
     use super::*;
 
     #[test]
-    fn default_command_uses_three_quarters_of_memory()
+    fn the_default_command_is_the_server_binary()
     {
-        assert_eq!(
-            resolve_command(4096, &HashMap::new()),
-            vec![
-                "java",
-                "-Xms3072M",
-                "-Xmx3072M",
-                "-jar",
-                "server.jar",
-                "nogui"
-            ]
-        );
-        assert_eq!(resolve_command(1, &HashMap::new())[1], "-Xms1M");
+        assert_eq!(resolve_command(&HashMap::new()), vec![SERVER_BINARY_PATH]);
     }
 
     #[test]
@@ -285,12 +293,35 @@ mod tests
     {
         let env = HashMap::from([(
             SERVER_COMMAND_ENV.to_owned(),
-            "exec java -jar paper.jar".to_owned(),
+            "exec ./server --port 25565".to_owned(),
         )]);
         assert_eq!(
-            resolve_command(4096, &env),
-            vec!["/bin/sh", "-c", "exec java -jar paper.jar"]
+            resolve_command(&env),
+            vec!["/bin/sh", "-c", "exec ./server --port 25565"]
         );
+    }
+
+    #[test]
+    fn missing_or_non_executable_binaries_are_rejected_clearly()
+    {
+        let scratch = tempfile::tempdir().unwrap();
+        let missing = scratch.path().join("quarry-server");
+        let error = check_executable(missing.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("is not available"), "{error}");
+        std::fs::write(&missing, b"#!/bin/sh\n").unwrap();
+        let error = check_executable(missing.to_str().unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("is not an executable file"),
+            "{error}"
+        );
+        std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_executable(missing.to_str().unwrap()).is_ok());
+        let error = check_executable(scratch.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            error.to_string().contains("is not an executable file"),
+            "{error}"
+        );
+        assert!(check_executable("sh").is_ok());
     }
 
     #[test]
