@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use guest_proto::{
     Configure, GuestBody, GuestMessage, Health, HostBody, HostMessage, Log, MAX_ERROR_BYTES,
-    MAX_HEAP_BYTES, RateLimiter, Ready, ShutdownComplete, SnapshotPrepared,
+    MAX_HEAP_BYTES, MAX_LOG_LINE_BYTES, RateLimiter, Ready, SERVER_BINARY_PATH, ShutdownComplete,
+    SnapshotPrepared,
 };
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -15,7 +16,7 @@ use crate::channel::{self, Connection, Halves};
 use crate::probe::{Prober, Step};
 use crate::server::{self, DATA_DIR, Server};
 use crate::snapshot::{self, FreezeOutcome};
-use crate::{EXIT_FAILURE, EXIT_OK, Settings, output, secrets};
+use crate::{EXIT_FAILURE, EXIT_OK, READY_PATTERN_ENV, Settings, output, secrets, world};
 
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const SAVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,6 +26,7 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const LOG_BURST: u32 = 100;
 const LOG_LINES_PER_SECOND: f64 = 50.0;
 const EVENT_QUEUE: usize = 1024;
+const INTERRUPT_FRACTION: f64 = 0.8;
 
 pub enum Event
 {
@@ -69,9 +71,30 @@ impl SnapshotState
 
 struct Stopping
 {
+    interrupt_at: Instant,
     deadline: Instant,
     stop_sent: bool,
+    interrupt_sent: bool,
     kill_sent: bool,
+}
+
+impl Stopping
+{
+    fn next_deadline(&self) -> Option<Instant>
+    {
+        if !self.interrupt_sent
+        {
+            Some(self.interrupt_at)
+        }
+        else if !self.kill_sent
+        {
+            Some(self.deadline)
+        }
+        else
+        {
+            None
+        }
+    }
 }
 
 struct Agent
@@ -93,6 +116,7 @@ struct Agent
     resume_after_freeze: bool,
     frozen: bool,
     stopping: Option<Stopping>,
+    ready_patterns: Vec<String>,
 }
 
 pub async fn run(settings: Settings) -> i32
@@ -125,6 +149,7 @@ pub async fn run(settings: Settings) -> i32
         log!("cannot reap orphaned processes: {error}");
     }
     channel::spawn_connector(settings.transport.clone(), events.clone());
+    let ready_patterns = output::ready_patterns(None, settings.ready_pattern.as_deref());
     let mut agent = Agent {
         settings,
         events,
@@ -143,6 +168,7 @@ pub async fn run(settings: Settings) -> i32
         resume_after_freeze: false,
         frozen: false,
         stopping: None,
+        ready_patterns,
     };
     loop
     {
@@ -180,11 +206,7 @@ impl Agent
 {
     fn next_deadline(&self) -> Option<Instant>
     {
-        let stop = self
-            .stopping
-            .as_ref()
-            .filter(|stopping| !stopping.kill_sent)
-            .map(|stopping| stopping.deadline);
+        let stop = self.stopping.as_ref().and_then(Stopping::next_deadline);
         let probe = self.prober.deadline().map(Instant::from_std);
         [stop, probe, self.snapshot.deadline(), self.next_health]
             .into_iter()
@@ -205,7 +227,7 @@ impl Agent
             {
                 if self.is_current(id)
                 {
-                    self.on_host_message(message)
+                    self.on_host_message(message).await
                 }
                 else
                 {
@@ -290,11 +312,11 @@ impl Agent
         }));
     }
 
-    fn on_host_message(&mut self, message: HostMessage) -> Option<i32>
+    async fn on_host_message(&mut self, message: HostMessage) -> Option<i32>
     {
         match message.body?
         {
-            HostBody::Configure(configure) => self.on_configure(configure),
+            HostBody::Configure(configure) => self.on_configure(configure).await,
             HostBody::ConsoleCommand(console) =>
             {
                 if self.server.is_some()
@@ -328,7 +350,7 @@ impl Agent
         }
     }
 
-    fn on_configure(&mut self, configure: Configure) -> Option<i32>
+    async fn on_configure(&mut self, configure: Configure) -> Option<i32>
     {
         if let Some((instance_id, generation)) = &self.configured
         {
@@ -379,8 +401,37 @@ impl Agent
             log!("cannot write secrets: {error}");
             return Some(EXIT_FAILURE);
         }
+        self.ready_patterns = output::ready_patterns(
+            configure.env.get(READY_PATTERN_ENV).map(String::as_str),
+            self.settings.ready_pattern.as_deref(),
+        );
+        let argv = if !configure.server_command.is_empty()
+        {
+            configure.server_command.clone()
+        }
+        else if let Some(shell) = server::shell_command(&configure.env)
+        {
+            shell
+        }
+        else
+        {
+            let data_dir = server::data_dir();
+            if let Err(error) = world::prepare(
+                SERVER_BINARY_PATH,
+                &data_dir,
+                &configure.instance_id,
+                &configure.env,
+                configure.memory_mib,
+                &dir.path,
+            )
+            .await
+            {
+                return Some(self.fail_start(&error));
+            }
+            world::default_command(SERVER_BINARY_PATH, &data_dir)
+        };
         match server::spawn(
-            &configure.server_command,
+            &argv,
             &configure.env,
             configure.memory_mib,
             &dir.path,
@@ -400,18 +451,20 @@ impl Agent
                 self.configured = Some((configure.instance_id, configure.generation));
                 None
             }
-            Err(error) =>
-            {
-                log!("cannot start the server: {error}");
-                self.send(GuestBody::Log(Log {
-                    line: output::single_line(
-                        &format!("quarry-guest-agent: cannot start the server: {error}"),
-                        guest_proto::MAX_LOG_LINE_BYTES,
-                    ),
-                }));
-                Some(EXIT_FAILURE)
-            }
+            Err(error) => Some(self.fail_start(&error.to_string())),
         }
+    }
+
+    fn fail_start(&self, error: &str) -> i32
+    {
+        log!("cannot start the server: {error}");
+        self.send(GuestBody::Log(Log {
+            line: output::single_line(
+                &format!("quarry-guest-agent: cannot start the server: {error}"),
+                MAX_LOG_LINE_BYTES,
+            ),
+        }));
+        EXIT_FAILURE
     }
 
     fn on_server_line(&mut self, line: String)
@@ -429,7 +482,10 @@ impl Agent
             {
                 self.server_version = version;
             }
-            if line.contains(&self.settings.ready_pattern)
+            if self
+                .ready_patterns
+                .iter()
+                .any(|pattern| line.contains(pattern.as_str()))
             {
                 self.ready = true;
                 log!("the server is ready (version {:?})", self.server_version);
@@ -502,11 +558,22 @@ impl Agent
     {
         let now = Instant::now();
         if let Some(stopping) = &mut self.stopping
+            && !stopping.interrupt_sent
+            && now >= stopping.interrupt_at
+        {
+            stopping.interrupt_sent = true;
+            if let Some(server) = &self.server
+            {
+                log!("the server is still running after `stop`; sending SIGINT");
+                server.interrupt();
+            }
+        }
+        if let Some(stopping) = &mut self.stopping
             && !stopping.kill_sent
             && now >= stopping.deadline
         {
             stopping.kill_sent = true;
-            if let Some(server) = &mut self.server
+            if let Some(server) = &self.server
             {
                 log!("the server did not exit before the deadline; killing it");
                 server.kill();
@@ -730,15 +797,23 @@ impl Agent
             }));
             return Some(EXIT_OK);
         }
-        let deadline = Instant::now() + limit;
+        let now = Instant::now();
+        let deadline = now + limit;
+        let interrupt_at = now + limit.mul_f64(INTERRUPT_FRACTION);
         match &mut self.stopping
         {
-            Some(stopping) => stopping.deadline = stopping.deadline.min(deadline),
+            Some(stopping) =>
+            {
+                stopping.deadline = stopping.deadline.min(deadline);
+                stopping.interrupt_at = stopping.interrupt_at.min(interrupt_at);
+            }
             None =>
             {
                 self.stopping = Some(Stopping {
+                    interrupt_at,
                     deadline,
                     stop_sent: false,
+                    interrupt_sent: false,
                     kill_sent: false,
                 });
                 self.next_health = None;

@@ -16,16 +16,26 @@ use tokio::time::timeout;
 const WAIT: Duration = Duration::from_secs(15);
 
 const FAKE_SERVER: &str = r#"#!/bin/sh
+if [ -n "$FAKE_IGNORE_INT" ]; then trap '' INT; fi
 echo "Starting minecraft server version 1.21.4"
 echo "pid $$"
 echo "secrets ${QUARRY_SECRETS_DIR:-none}"
 echo "memory ${QUARRY_MEMORY_MIB:-none}"
 printf 'color \033[31mred\033[0m end\n'
-echo "Done (0.1s)! For help, type \"help\""
+if [ -n "$FAKE_QUARRY" ]; then
+  echo "2026-10-30T01:35:10.217244Z  INFO Quarry running in embedded mode address=127.0.0.1:25599 world=/data/world"
+else
+  echo "Done (0.1s)! For help, type \"help\""
+fi
 while IFS= read -r line; do
   case "$line" in
     list) echo "There are 3 of a max of 20 players online: a, b, c" ;;
-    tps) echo "TPS from last 1m, 5m, 15m: *19.5, 20.0, 20.0" ;;
+    tps)
+      if [ -n "$FAKE_QUARRY" ]; then
+        echo "2026-10-30T01:35:11.000000Z  INFO TPS (5s, 1m): 18.0, 19.5 | MSPT: 0.11 ms (last 0.08 ms)"
+      else
+        echo "TPS from last 1m, 5m, 15m: *19.5, 20.0, 20.0"
+      fi ;;
     mspt) echo "Unknown or incomplete command, see below for error"; echo "mspt<--[HERE]" ;;
     "save-all flush") echo "> save-all flush"; echo "Saving the game (this may take a moment!)"; echo "Saved the game" ;;
     whoami) echo "pid $$" ;;
@@ -343,13 +353,84 @@ async fn shutdown_kills_a_server_that_ignores_stop()
 {
     let mut harness = Harness::start();
     let mut host = harness.accept().await;
-    host.send(harness.configure(&[("FAKE_IGNORE_STOP", "1")], &[]))
+    host.send(harness.configure(&[("FAKE_IGNORE_STOP", "1"), ("FAKE_IGNORE_INT", "1")], &[]))
         .await;
     host.ready().await;
     host.send(HostBody::Shutdown(Shutdown { deadline_ms: 300 }))
         .await;
     assert_eq!(host.shutdown_complete().await, 128 + 9);
     assert_eq!(harness.exit_code().await, Some(0));
+    let stderr = harness.stderr();
+    assert!(stderr.contains("sending SIGINT"), "{stderr}");
+    assert!(stderr.contains("killing it"), "{stderr}");
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_a_server_that_ignores_stop_before_killing_it()
+{
+    let mut harness = Harness::start();
+    let mut host = harness.accept().await;
+    host.send(harness.configure(&[("FAKE_IGNORE_STOP", "1")], &[]))
+        .await;
+    host.ready().await;
+    host.send(HostBody::Shutdown(Shutdown { deadline_ms: 2_000 }))
+        .await;
+    assert_eq!(host.shutdown_complete().await, 128 + 2);
+    assert_eq!(harness.exit_code().await, Some(0));
+    assert!(!harness.stderr().contains("killing it"));
+}
+
+#[tokio::test]
+async fn quarry_readiness_and_tps_output_are_recognized()
+{
+    let harness = Harness::start();
+    let mut host = harness.accept().await;
+    host.send(harness.configure(&[("FAKE_QUARRY", "1")], &[]))
+        .await;
+    host.ready().await;
+    let health = host
+        .wait_for(|body| match body
+        {
+            GuestBody::Health(health) => Some(health.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(health.players, 3);
+    assert_eq!(health.tps, 19.5);
+    assert_eq!(health.mspt, 0.11);
+    host.command("say flush").await;
+    host.log_containing("> say flush").await;
+    assert!(host.logs().iter().all(|line| !line.contains("TPS (")));
+    assert!(!harness.stderr().contains("does not support `mspt`"));
+}
+
+#[tokio::test]
+async fn a_configured_ready_pattern_overrides_the_defaults()
+{
+    let harness = Harness::start();
+    let mut host = harness.accept().await;
+    host.send(harness.configure(&[("QUARRY_READY_PATTERN", "pid ")], &[]))
+        .await;
+    host.ready().await;
+    host.log_containing("Done (").await;
+    let ready = host
+        .received
+        .iter()
+        .position(|body| matches!(body, GuestBody::Ready(_)))
+        .unwrap();
+    let done = host
+        .received
+        .iter()
+        .position(|body| matches!(body, GuestBody::Log(log) if log.line.starts_with("Done (")))
+        .unwrap();
+    assert!(ready < done);
+    assert_eq!(
+        host.received
+            .iter()
+            .filter(|body| matches!(body, GuestBody::Ready(_)))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -496,6 +577,7 @@ async fn a_missing_default_server_binary_fails_cleanly()
     assert!(line.contains(guest_proto::SERVER_BINARY_PATH), "{line}");
     assert_eq!(harness.exit_code().await, Some(1));
     assert!(harness.stderr().contains(guest_proto::SERVER_BINARY_PATH));
+    assert!(!harness.dir.path().join("quarry.toml").exists());
 }
 
 fn mode(path: &Path) -> u32

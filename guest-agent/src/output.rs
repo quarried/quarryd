@@ -2,7 +2,11 @@ use guest_proto::{MAX_LOG_LINE_BYTES, MAX_SERVER_VERSION_BYTES};
 
 const VERSION_MARKER: &str = "Starting minecraft server version ";
 const PLAYERS_MARKER: &str = "There are ";
-const TPS_MARKER: &str = "TPS from last 1m, 5m, 15m:";
+const PAPER_TPS_MARKER: &str = "TPS from last 1m, 5m, 15m:";
+const QUARRY_TPS_MARKER: &str = "TPS (";
+const QUARRY_MSPT_MARKER: &str = "MSPT:";
+const QUARRY_TPS_WINDOW: &str = "1m";
+pub const DEFAULT_READY_PATTERNS: [&str; 2] = ["Done (", "Quarry running in embedded mode"];
 const MSPT_HEADER: &str = "Server tick times";
 
 pub fn sanitize(raw: &[u8]) -> String
@@ -123,12 +127,55 @@ pub fn players(line: &str) -> Option<u32>
     digits.parse().ok()
 }
 
-pub fn tps(line: &str) -> Option<f64>
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TpsReading
+{
+    pub tps: f64,
+    pub mspt: Option<f64>,
+}
+
+pub fn tps(line: &str) -> Option<TpsReading>
 {
     let plain = without_color_codes(line);
-    let start = plain.find(TPS_MARKER)? + TPS_MARKER.len();
-    let first = plain[start..].split(',').next()?;
-    leading_number(first)
+    if let Some(start) = plain.find(PAPER_TPS_MARKER)
+    {
+        let first = plain[start + PAPER_TPS_MARKER.len()..].split(',').next()?;
+        return Some(TpsReading {
+            tps: leading_number(first)?,
+            mspt: None,
+        });
+    }
+    let start = plain.find(QUARRY_TPS_MARKER)? + QUARRY_TPS_MARKER.len();
+    let rest = &plain[start..];
+    let (windows, rest) = rest.split_once("):")?;
+    let (values, after) = rest.split_once('|').unwrap_or((rest, ""));
+    let window = windows
+        .split(',')
+        .position(|window| window.trim() == QUARRY_TPS_WINDOW)
+        .unwrap_or(0);
+    let values: Vec<&str> = values.split(',').collect();
+    let value = values.get(window).or(values.first())?;
+    let mspt = after
+        .find(QUARRY_MSPT_MARKER)
+        .and_then(|start| leading_number(&after[start + QUARRY_MSPT_MARKER.len()..]));
+    Some(TpsReading {
+        tps: leading_number(value)?,
+        mspt,
+    })
+}
+
+pub fn ready_patterns(configured: Option<&str>, process: Option<&str>) -> Vec<String>
+{
+    match configured
+        .filter(|pattern| !pattern.is_empty())
+        .or(process.filter(|pattern| !pattern.is_empty()))
+    {
+        Some(pattern) => vec![pattern.to_owned()],
+        None => DEFAULT_READY_PATTERNS
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect(),
+    }
 }
 
 pub fn is_mspt_header(line: &str) -> bool
@@ -252,23 +299,67 @@ mod tests
         assert_eq!(players("players online"), None);
     }
 
+    fn reading(tps: f64, mspt: Option<f64>) -> Option<TpsReading>
+    {
+        Some(TpsReading { tps, mspt })
+    }
+
     #[test]
     fn tps_is_parsed_from_paper_output()
     {
         assert_eq!(
             tps("[12:00:00 INFO]: TPS from last 1m, 5m, 15m: 20.0, 20.0, 19.98"),
-            Some(20.0)
+            reading(20.0, None)
         );
         assert_eq!(
             tps("TPS from last 1m, 5m, 15m: *19.5, 20.0, 20.0"),
-            Some(19.5)
+            reading(19.5, None)
         );
         assert_eq!(
             tps("§6TPS from last 1m, 5m, 15m: §a*20.0§r, §a20.0"),
-            Some(20.0)
+            reading(20.0, None)
         );
         assert_eq!(tps("TPS from last 1m, 5m, 15m: n/a"), None);
         assert_eq!(tps("Unknown command"), None);
+    }
+
+    #[test]
+    fn tps_and_mspt_are_parsed_from_quarry_output()
+    {
+        assert_eq!(
+            tps(
+                "2026-10-30T01:35:10.217244Z  INFO TPS (5s, 1m): 18.5, 19.75 | MSPT: 0.11 ms (last 0.08 ms)"
+            ),
+            reading(19.75, Some(0.11))
+        );
+        assert_eq!(
+            tps("INFO TPS (1m, 5s): 17.0, 20.0 | MSPT: 42.5 ms"),
+            reading(17.0, Some(42.5))
+        );
+        assert_eq!(tps("INFO TPS (5s): 12.0"), reading(12.0, None));
+        assert_eq!(
+            tps("INFO TPS (5s, 1m): 20.0, 20.0 | MSPT: n/a"),
+            reading(20.0, None)
+        );
+        assert_eq!(tps("INFO TPS (5s, 1m) missing colon"), None);
+    }
+
+    #[test]
+    fn ready_patterns_default_to_vanilla_and_quarry_and_can_be_overridden()
+    {
+        assert_eq!(
+            ready_patterns(None, None),
+            vec!["Done (", "Quarry running in embedded mode"]
+        );
+        assert_eq!(
+            ready_patterns(Some(""), Some("")),
+            ready_patterns(None, None)
+        );
+        assert_eq!(ready_patterns(None, Some("Listening")), vec!["Listening"]);
+        assert_eq!(
+            ready_patterns(Some("Started"), Some("Listening")),
+            vec!["Started"]
+        );
     }
 
     #[test]

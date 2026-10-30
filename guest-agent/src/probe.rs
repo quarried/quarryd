@@ -68,6 +68,7 @@ pub struct Prober
     unsupported: [bool; 3],
     pending: Option<Pending>,
     swallow_marker: bool,
+    mspt_from_tps: bool,
 }
 
 impl Prober
@@ -79,6 +80,7 @@ impl Prober
             unsupported: [false; 3],
             pending: None,
             swallow_marker: false,
+            mspt_from_tps: false,
         }
     }
 
@@ -100,6 +102,7 @@ impl Prober
         {
             return Step::Wait;
         }
+        self.mspt_from_tps = false;
         self.advance_from(0, now)
     }
 
@@ -147,9 +150,14 @@ impl Prober
             }
             Probe::Tps =>
             {
-                if let Some(tps) = output::tps(line)
+                if let Some(reading) = output::tps(line)
                 {
-                    self.sample.tps = tps.clamp(0.0, MAX_TPS);
+                    self.sample.tps = reading.tps.clamp(0.0, MAX_TPS);
+                    if let Some(mspt) = reading.mspt
+                    {
+                        self.sample.mspt = mspt.clamp(0.0, MAX_MSPT);
+                        self.mspt_from_tps = true;
+                    }
                     return (true, self.advance(now));
                 }
             }
@@ -187,9 +195,9 @@ impl Prober
 
     fn advance_from(&mut self, start: usize, now: Instant) -> Step
     {
-        match ORDER[start.min(ORDER.len())..]
-            .iter()
-            .find(|probe| !self.unsupported[probe.index()])
+        match ORDER[start.min(ORDER.len())..].iter().find(|probe| {
+            !self.unsupported[probe.index()] && !(self.mspt_from_tps && **probe == Probe::Mspt)
+        })
         {
             Some(&probe) =>
             {
@@ -349,6 +357,64 @@ mod tests
         assert_eq!(prober.expire(later + PROBE_TIMEOUT * 2), Step::Complete);
         assert_eq!(prober.sample(), Sample::default());
         assert_eq!(prober.begin(later + PROBE_TIMEOUT * 3), Step::Send("list"));
+    }
+
+    #[test]
+    fn a_quarry_tps_reply_carries_mspt_and_skips_the_mspt_probe()
+    {
+        let now = Instant::now();
+        let mut prober = Prober::new();
+        assert_eq!(prober.begin(now), Step::Send("list"));
+        observe(
+            &mut prober,
+            "INFO There are 2 of a max of 20 players online: ",
+            now,
+        );
+        assert_eq!(
+            observe(
+                &mut prober,
+                "INFO TPS (5s, 1m): 18.0, 19.5 | MSPT: 0.11 ms (last 0.08 ms)",
+                now
+            ),
+            (true, Step::Complete)
+        );
+        assert_eq!(
+            prober.sample(),
+            Sample {
+                players: 2,
+                tps: 19.5,
+                mspt: 0.11
+            }
+        );
+        assert_eq!(prober.begin(now), Step::Send("list"));
+        observe(
+            &mut prober,
+            "There are 2 of a max of 20 players online:",
+            now,
+        );
+        assert_eq!(
+            observe(
+                &mut prober,
+                "TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0",
+                now
+            ),
+            (true, Step::Send("mspt"))
+        );
+    }
+
+    #[test]
+    fn a_quarry_mspt_value_is_clamped()
+    {
+        let now = Instant::now();
+        let mut prober = Prober::new();
+        prober.begin(now);
+        observe(
+            &mut prober,
+            "There are 0 of a max of 20 players online:",
+            now,
+        );
+        observe(&mut prober, "TPS (5s, 1m): 1, 2 | MSPT: 99999 ms", now);
+        assert_eq!(prober.sample().mspt, MAX_MSPT);
     }
 
     #[test]

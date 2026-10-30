@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use guest_proto::{
     GuestMessage, GuestProtoError, HostBody, HostMessage, MAX_FRAME_BYTES, MAX_HOST_FRAME_BYTES,
-    Transport, decode_host_message, read_frame, write_message,
+    SERVER_BINARY_PATH, Transport, decode_host_message, read_frame, write_message,
 };
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -11,7 +11,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::agent::Event;
-use crate::server;
 
 const OUTBOUND_QUEUE: usize = 256;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -95,8 +94,13 @@ pub fn decode_host(bytes: &[u8]) -> Result<HostMessage, GuestProtoError>
     if let Some(HostBody::Configure(configure)) = &mut message.body
         && configure.server_command.is_empty()
     {
-        configure.server_command = server::resolve_command(&configure.env);
-        return decode_host_message(&message.encode_to_vec());
+        configure.server_command = vec![SERVER_BINARY_PATH.to_owned()];
+        let mut validated = decode_host_message(&message.encode_to_vec())?;
+        if let Some(HostBody::Configure(configure)) = &mut validated.body
+        {
+            configure.server_command.clear();
+        }
+        return Ok(validated);
     }
     decode_host_message(bytes)
 }
@@ -258,21 +262,14 @@ mod tests
     }
 
     #[test]
-    fn an_empty_server_command_falls_back_to_the_server_binary()
+    fn an_empty_server_command_is_validated_and_left_for_the_agent_to_resolve()
     {
-        let decoded = decode_host(&configure(Vec::new(), HashMap::new())).unwrap();
-        assert_eq!(command_of(decoded), vec![guest_proto::SERVER_BINARY_PATH]);
-    }
-
-    #[test]
-    fn an_empty_server_command_uses_the_env_command()
-    {
-        let env = HashMap::from([(
-            server::SERVER_COMMAND_ENV.to_owned(),
-            "./start.sh".to_owned(),
-        )]);
+        let env = HashMap::from([("QUARRY_SERVER_COMMAND".to_owned(), "./start.sh".to_owned())]);
         let decoded = decode_host(&configure(Vec::new(), env)).unwrap();
-        assert_eq!(command_of(decoded), vec!["/bin/sh", "-c", "./start.sh"]);
+        assert!(command_of(decoded).is_empty());
+        let mut bad_env = HashMap::new();
+        bad_env.insert("A=B".to_owned(), String::new());
+        assert!(decode_host(&configure(Vec::new(), bad_env)).is_err());
     }
 
     #[test]

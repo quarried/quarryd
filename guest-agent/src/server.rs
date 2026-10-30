@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use guest_proto::{MAX_LOG_LINE_BYTES, SERVER_BINARY_PATH};
+use guest_proto::MAX_LOG_LINE_BYTES;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::agent::Event;
@@ -21,6 +21,7 @@ pub const SERVER_COMMAND_ENV: &str = "QUARRY_SERVER_COMMAND";
 pub const MEMORY_MIB_ENV: &str = "QUARRY_MEMORY_MIB";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const COMMAND_QUEUE: usize = 64;
+const SIGNAL_QUEUE: usize = 4;
 const OUTPUT_DRAIN: Duration = Duration::from_secs(1);
 const MAX_RAW_LINE_BYTES: usize = MAX_LOG_LINE_BYTES * 4;
 
@@ -28,7 +29,14 @@ pub struct Server
 {
     pid: u32,
     commands: mpsc::Sender<String>,
-    kill: Option<oneshot::Sender<()>>,
+    signals: mpsc::Sender<Signal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Signal
+{
+    Interrupt,
+    Kill,
 }
 
 impl Server
@@ -46,25 +54,24 @@ impl Server
         }
     }
 
-    pub fn kill(&mut self)
+    pub fn interrupt(&self)
     {
-        if let Some(kill) = self.kill.take()
-        {
-            let _ = kill.send(());
-        }
+        let _ = self.signals.try_send(Signal::Interrupt);
+    }
+
+    pub fn kill(&self)
+    {
+        let _ = self.signals.try_send(Signal::Kill);
     }
 }
 
-pub fn resolve_command(env: &HashMap<String, String>) -> Vec<String>
+pub fn shell_command(env: &HashMap<String, String>) -> Option<Vec<String>>
 {
-    match env.get(SERVER_COMMAND_ENV)
-    {
-        Some(script) => vec!["/bin/sh".to_owned(), "-c".to_owned(), script.clone()],
-        None => vec![SERVER_BINARY_PATH.to_owned()],
-    }
+    env.get(SERVER_COMMAND_ENV)
+        .map(|script| vec!["/bin/sh".to_owned(), "-c".to_owned(), script.clone()])
 }
 
-fn check_executable(program: &str) -> io::Result<()>
+pub fn check_executable(program: &str) -> io::Result<()>
 {
     if !program.contains('/')
     {
@@ -86,7 +93,7 @@ fn check_executable(program: &str) -> io::Result<()>
     Ok(())
 }
 
-fn working_dir() -> PathBuf
+pub fn data_dir() -> PathBuf
 {
     let data = Path::new(DATA_DIR);
     if data.is_dir()
@@ -94,6 +101,26 @@ fn working_dir() -> PathBuf
         return data.to_path_buf();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn base_command(
+    program: &str,
+    env: &HashMap<String, String>,
+    memory_mib: u64,
+    secrets_dir: &Path,
+) -> Command
+{
+    let mut command = Command::new(program);
+    command
+        .envs(env)
+        .env(SECRETS_DIR_ENV, secrets_dir)
+        .env(MEMORY_MIB_ENV, memory_mib.to_string())
+        .current_dir(data_dir());
+    if std::env::var_os("PATH").is_none() && !env.contains_key("PATH")
+    {
+        command.env("PATH", DEFAULT_PATH);
+    }
+    command
 }
 
 pub fn spawn(
@@ -108,20 +135,12 @@ pub fn spawn(
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty server command"))?;
     check_executable(program)?;
-    let mut command = Command::new(program);
+    let mut command = base_command(program, env, memory_mib, secrets_dir);
     command
         .args(arguments)
-        .envs(env)
-        .env(SECRETS_DIR_ENV, secrets_dir)
-        .env(MEMORY_MIB_ENV, memory_mib.to_string())
-        .current_dir(working_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if std::env::var_os("PATH").is_none() && !env.contains_key("PATH")
-    {
-        command.env("PATH", DEFAULT_PATH);
-    }
     let mut child = command.spawn()?;
     let missing = |what: &str| io::Error::other(format!("server {what} is not available"));
     let pid = child.id().ok_or_else(|| missing("pid"))?;
@@ -134,12 +153,12 @@ pub fn spawn(
         tokio::spawn(read_lines(stdout, events.clone())),
         tokio::spawn(read_lines(stderr, events.clone())),
     ];
-    let (kill, kill_requested) = oneshot::channel();
-    tokio::spawn(supervise(child, readers, kill_requested, events));
+    let (signals, pending_signals) = mpsc::channel(SIGNAL_QUEUE);
+    tokio::spawn(supervise(child, readers, pending_signals, events));
     Ok(Server {
         pid,
         commands,
-        kill: Some(kill),
+        signals,
     })
 }
 
@@ -163,19 +182,26 @@ async fn feed_console(mut stdin: ChildStdin, mut commands: mpsc::Receiver<String
 async fn supervise(
     mut child: Child,
     readers: [JoinHandle<()>; 2],
-    kill_requested: oneshot::Receiver<()>,
+    mut signals: mpsc::Receiver<Signal>,
     events: mpsc::Sender<Event>,
 )
 {
-    let status = tokio::select! {
-        status = child.wait() => status,
-        _ = kill_requested =>
-        {
-            if let Err(error) = child.start_kill()
+    let status = loop
+    {
+        tokio::select! {
+            status = child.wait() => break status,
+            signal = signals.recv() => match signal
             {
-                log!("cannot kill the server: {error}");
-            }
-            child.wait().await
+                Some(Signal::Interrupt) => interrupt(&child),
+                Some(Signal::Kill) | None =>
+                {
+                    if let Err(error) = child.start_kill()
+                    {
+                        log!("cannot kill the server: {error}");
+                    }
+                    break child.wait().await;
+                }
+            },
         }
     };
     let code = match status
@@ -193,6 +219,22 @@ async fn supervise(
         let _ = tokio::time::timeout_at(drain_until, reader).await;
     }
     let _ = events.send(Event::ServerExited(code)).await;
+}
+
+fn interrupt(child: &Child)
+{
+    let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok())
+    else
+    {
+        return;
+    };
+    if let Err(errno) = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    {
+        log!("cannot interrupt the server: {errno}");
+    }
 }
 
 pub fn exit_code(status: ExitStatus) -> i32
@@ -283,12 +325,6 @@ mod tests
     use super::*;
 
     #[test]
-    fn the_default_command_is_the_server_binary()
-    {
-        assert_eq!(resolve_command(&HashMap::new()), vec![SERVER_BINARY_PATH]);
-    }
-
-    #[test]
     fn server_command_env_runs_through_the_shell()
     {
         let env = HashMap::from([(
@@ -296,9 +332,10 @@ mod tests
             "exec ./server --port 25565".to_owned(),
         )]);
         assert_eq!(
-            resolve_command(&env),
+            shell_command(&env).unwrap(),
             vec!["/bin/sh", "-c", "exec ./server --port 25565"]
         );
+        assert_eq!(shell_command(&HashMap::new()), None);
     }
 
     #[test]

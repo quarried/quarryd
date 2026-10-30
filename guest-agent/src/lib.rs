@@ -14,6 +14,7 @@ mod probe;
 mod secrets;
 mod server;
 mod snapshot;
+mod world;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -25,12 +26,11 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
 const READY_PATTERN_ENV: &str = "QUARRY_READY_PATTERN";
-const DEFAULT_READY_PATTERN: &str = "Done (";
 
 struct Settings
 {
     transport: Transport,
-    ready_pattern: String,
+    ready_pattern: Option<String>,
     secrets_override: Option<PathBuf>,
     vm_init: bool,
 }
@@ -63,7 +63,7 @@ pub async fn run() -> i32
     }
     let settings = Settings {
         transport,
-        ready_pattern: ready_pattern(std::env::var(READY_PATTERN_ENV).ok()),
+        ready_pattern: std::env::var(READY_PATTERN_ENV).ok(),
         secrets_override: std::env::var_os(secrets::SECRETS_DIR_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
@@ -99,13 +99,6 @@ fn parse_transport(value: Option<OsString>) -> Result<Transport, String>
         return Err(format!("{TRANSPORT_ENV}: vsock is only available on Linux"));
     }
     Ok(transport)
-}
-
-fn ready_pattern(value: Option<String>) -> String
-{
-    value
-        .filter(|pattern| !pattern.is_empty())
-        .unwrap_or_else(|| DEFAULT_READY_PATTERN.to_owned())
 }
 
 #[cfg(test)]
@@ -153,16 +146,5 @@ mod tests
         use std::os::unix::ffi::OsStringExt;
         let value = OsString::from_vec(vec![b'u', b'n', 0xff]);
         assert!(parse_transport(Some(value)).unwrap_err().contains("UTF-8"));
-    }
-
-    #[test]
-    fn ready_pattern_defaults_and_overrides()
-    {
-        assert_eq!(ready_pattern(None), "Done (");
-        assert_eq!(ready_pattern(Some(String::new())), "Done (");
-        assert_eq!(
-            ready_pattern(Some("Server started".into())),
-            "Server started"
-        );
     }
 }
