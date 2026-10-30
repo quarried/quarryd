@@ -77,7 +77,7 @@
 - 10 | Interface name collisions? | Names derive from a 40-bit FNV-1a hash of the instance id; a colliding attach is refused | IFNAMSIZ limits names to 15 characters.
 - 4.8 | Guest reconnect policy? | Retry forever, 100 ms doubling to 2 s; Ready re-sent on every reconnect | Adoption needs the guest to find the re-created host listener without restarting the server.
 - 4.8 | Configure for a different generation while running? | Ignored; generation changes are host-side restarts | Configure is idempotent.
-- 4.8 | Server command when Configure carries none? | /bin/sh -c "$QUARRY_SERVER_COMMAND" from the spec env, otherwise java -Xms/-Xmx at 75 % of memory_mib | Lets images and tests choose the server.
+- 4.8 | Server command when Configure carries none? | /bin/sh -c "$QUARRY_SERVER_COMMAND" from the spec env, otherwise the native binary /usr/local/bin/quarry-server with QUARRY_MEMORY_MIB in its environment; a missing binary fails the instance | The server is a native Linux binary baked into the rootfs; images and tests can override the command.
 - 4.8 | Readiness detection? | Server output line containing "Done (" (override QUARRY_READY_PATTERN) | Vanilla and Paper print it when the world is loaded.
 - 4.8 | Guest log rate? | 50 lines/s, burst 100, then a dropped-lines notice | Stays under the host's rate limiter.
 - 4.8 | Health probes? | list, tps, mspt sent to the console one at a time every 10 s; unsupported probes are disabled; heap from server VmRSS | Values are display-only.
@@ -88,3 +88,32 @@
 - 4.8 | PID 1 duties in Firecracker? | Mount proc/sys/dev/run/tmp and /dev/vdb at /data, reap zombies, and on exit kill, unmount, sync, then reboot (Firecracker exits on guest reboot with reboot=k) | Firecracker has no ACPI power-off.
 - 12 | quarryctl scope? | list, show, console [--tail] [--follow], diagnostics; opens SQLite read-only and never writes | Section 10: no local API that changes state.
 - 12 | Secrets in quarryctl output? | Env keys and secret names only | Section 10.
+- 6 | How does admission rejection fit the diagram? | Extra edges Pending/Stopped/Failed → Rejected and Rejected → Pending/Deleting | The diagram has no rejection state; these are the minimum for re-evaluating later generations.
+- 6 | Delete before admission? | Pending → Deleting | Nothing has been provisioned that needs stopping.
+- 6 | Re-put while Deleting? | Deletion finishes, then the row is recreated as Pending | The newer desired state is not lost.
+- 6 | New generation of a running instance rejected? | Graceful stop, then Stopped → Rejected | Resources may not be held without admission.
+- 6 | Stop, new generation, or lease loss during Booting/Starting? | Wait until Running or Failed; delete goes via Failed → Deleting | The diagram has no Booting/Starting → Stopping edge.
+- 6 | Where is a new generation prepared? | In Stopped or Failed, idempotently, before Booting | The diagram has no Stopped → Preparing edge but specs change between generations.
+- 6 | Failed instance whose desired state is stopped? | Stays Failed | There is no Failed → Stopped edge.
+- 4.4 | Unspecified restart policy? | on-failure | Safe default.
+- 4.4 | Restart policy details? | always restarts immediately; on-failure backs off exponentially and skips clean exit 0; the restart count resets after Running for restart_backoff_max or on a new generation | Section 4.4 names backoff only for on-failure.
+- 8 | When does spec.lease apply? | Only when the put inserts or updates the stored spec | A replayed put must not refresh an expired lease.
+- 8 | Lease grant with ttl 0 or a lower epoch? | ttl 0 uses the configured default; lower epochs are ignored; wall-clock expiry is persisted | Section 8 and the configurable TTL.
+- 4.2 | Put with an invalid instance id? | Rejected status only, no row | The id cannot safely name a row, volume, or socket.
+- 4.2 | Delete of an unknown id? | Report Deleted with reason "unknown instance" | The control plane converges.
+- 11 | What counts as committed resources? | All instances except rejected and delete-requested ones | No overcommit.
+- 11 | What is "new" while draining? | Pending or Rejected instances; new generations of existing instances are still admitted | Drain stops placement, not updates.
+- 10 | Where are secret values kept on the node? | Only in memory; the stored spec keeps names with empty values; after a restart a boot waits for the control plane to re-send the spec | Secrets never touch the host disk.
+- 4.8 | Is Configure re-sent on guest reconnect? | Only while Booting; in Starting/Running a re-sent Ready is accepted | Configure is per boot.
+- 4.8 | Guest abuse handling? | Oversized frame, invalid frame, or rate limit exceeded drops that guest's connection and increments an abuse counter in diagnostics | Isolation between instances.
+- 4.8 | Guest connections per instance? | One; a new connection replaces the old | The guest agent reconnects after restarts.
+- 4.8 | Missing health reports? | After 30 s a warning in the status reason, no restart | Restart policy covers crashes only.
+- 9 | Unadoptable instance after restart? | Failed with "not adoptable after restart" (plus "waiting for lease" if expired); Stopping becomes Stopped; stray sandboxes in idle phases are destroyed | Section 9.
+- 4.6 | Volume naming and disks? | <id>-<disk> sanitized to [A-Za-z0-9+_.-], at most 100 chars; exactly one data disk required | The sandbox has one data drive.
+- 4.6 | Crash-safe restore? | kv markers reconciler/restore/<volume> (pending → done); a pending restore is redone | A half-restored volume is never booted.
+- 4.6 | Local snapshot handling? | Named <volume>-snap-<unix>, deleted after upload; SnapshotPrepared timeout 60 s; ResumeWrites always sent | World writes always resume.
+- 4.4 | Instance files on delete? | state_dir/<id> including the console ring is removed | Delete leaves nothing behind.
+- 11 | CPU pinning assignment? | Slot = uid − uid_base over CPUs [reservation.vcpus, capacity.vcpus) | Deterministic and keeps host-reserved CPUs free.
+- 11 | Balloon idle reclaim amount? | Half of memory_mib; unsupported backends log once | Opt-in low-tier reclaim.
+- 4.9 | Usage source errors? | The sample is skipped | Nothing is counted twice; deltas catch up on the next sample.
+- 4.4 | Sandbox status polling? | Every 500 ms | Prompt crash detection.
