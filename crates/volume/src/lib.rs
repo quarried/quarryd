@@ -1,0 +1,75 @@
+mod error;
+mod file;
+mod lvm;
+mod snapshot;
+mod volumes;
+
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+pub use error::VolumeError;
+pub use file::FileVolume;
+pub use lvm::LvmThin;
+pub use snapshot::{ChunkRef, MANIFEST_FORMAT_VERSION, SnapshotManifest, SnapshotStore};
+pub use volumes::{CRITICAL_PERCENT, PoolAlert, PoolStatus, Volumes, WARNING_PERCENT};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumeKind
+{
+    LvmThin,
+    File,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeInfo
+{
+    pub name: String,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoolUsage
+{
+    pub size_bytes: u64,
+    pub used_percent: f64,
+}
+
+#[async_trait]
+pub trait Volume: Send + Sync
+{
+    fn kind(&self) -> VolumeKind;
+    async fn create(&self, name: &str, size_bytes: u64) -> Result<VolumeInfo, VolumeError>;
+    async fn create_blank(&self, name: &str, size_bytes: u64) -> Result<VolumeInfo, VolumeError>;
+    async fn get(&self, name: &str) -> Result<Option<VolumeInfo>, VolumeError>;
+    async fn list(&self) -> Result<Vec<VolumeInfo>, VolumeError>;
+    async fn delete(&self, name: &str) -> Result<(), VolumeError>;
+    async fn snapshot(&self, name: &str, snapshot_name: &str) -> Result<VolumeInfo, VolumeError>;
+    async fn pool_usage(&self) -> Result<PoolUsage, VolumeError>;
+}
+
+const MAX_NAME_LEN: usize = 127;
+
+pub(crate) fn validate_name(name: &str) -> Result<(), VolumeError>
+{
+    let valid_chars = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '.' | '-'));
+    let valid = !name.is_empty()
+        && name.len() <= MAX_NAME_LEN
+        && valid_chars
+        && !name.starts_with('-')
+        && !name.starts_with('.');
+    if valid
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(VolumeError::InvalidName {
+            name: name.to_owned(),
+        })
+    }
+}
