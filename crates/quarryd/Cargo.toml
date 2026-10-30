@@ -7,6 +7,13 @@ publish = false
 
 [dependencies]
 proto = { workspace = true }
+reconciler = { workspace = true }
+sandbox = { workspace = true }
+volume = { workspace = true }
+network = { workspace = true }
+store = { workspace = true }
+usage = { workspace = true }
+object_store = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -24,4 +31,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 stub-control-plane = { path = "../stub-control-plane" }
+guest-agent = { path = "../../guest-agent" }
+guest-proto = { workspace = true }
+minisign = "0.10"
+sha2 = { workspace = true }
 tempfile = { workspace = true }

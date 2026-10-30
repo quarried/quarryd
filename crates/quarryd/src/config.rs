@@ -235,6 +235,18 @@ pub struct InstancesConfig
     pub stop_deadline_secs: u64,
     #[serde(default = "default_kill_deadline_secs")]
     pub kill_deadline_secs: u64,
+    #[serde(default = "default_restart_backoff_base_ms")]
+    pub restart_backoff_base_ms: u64,
+    #[serde(default = "default_restart_backoff_max_secs")]
+    pub restart_backoff_max_secs: u64,
+    #[serde(default = "default_guest_rate_capacity")]
+    pub guest_rate_capacity: u32,
+    #[serde(default = "default_guest_rate_per_sec")]
+    pub guest_rate_per_sec: f64,
+    #[serde(default = "default_guest_connect_timeout_secs")]
+    pub guest_connect_timeout_secs: u64,
+    #[serde(default = "default_ready_timeout_secs")]
+    pub ready_timeout_secs: u64,
 }
 
 impl Default for InstancesConfig
@@ -247,6 +259,12 @@ impl Default for InstancesConfig
             console_max_bytes: default_console_max_bytes(),
             stop_deadline_secs: default_stop_deadline_secs(),
             kill_deadline_secs: default_kill_deadline_secs(),
+            restart_backoff_base_ms: default_restart_backoff_base_ms(),
+            restart_backoff_max_secs: default_restart_backoff_max_secs(),
+            guest_rate_capacity: default_guest_rate_capacity(),
+            guest_rate_per_sec: default_guest_rate_per_sec(),
+            guest_connect_timeout_secs: default_guest_connect_timeout_secs(),
+            ready_timeout_secs: default_ready_timeout_secs(),
         }
     }
 }
@@ -439,6 +457,36 @@ fn default_stop_deadline_secs() -> u64
 fn default_kill_deadline_secs() -> u64
 {
     10
+}
+
+fn default_restart_backoff_base_ms() -> u64
+{
+    1000
+}
+
+fn default_restart_backoff_max_secs() -> u64
+{
+    300
+}
+
+fn default_guest_rate_capacity() -> u32
+{
+    200
+}
+
+fn default_guest_rate_per_sec() -> f64
+{
+    50.0
+}
+
+fn default_guest_connect_timeout_secs() -> u64
+{
+    120
+}
+
+fn default_ready_timeout_secs() -> u64
+{
+    600
 }
 
 #[cfg(test)]

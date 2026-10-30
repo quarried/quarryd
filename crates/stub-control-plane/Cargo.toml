@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+rustls = { workspace = true }
 anyhow = { workspace = true }
 proto = { workspace = true }
 rcgen = { workspace = true }

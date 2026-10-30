@@ -77,6 +77,7 @@ impl StubControlPlane
     /// Binds `config.listen` and serves `AgentGateway` over mTLS in a spawned task.
     pub async fn start(config: StubConfig) -> Result<StubControlPlane, StubError>
     {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = TcpListener::bind(config.listen).await?;
         let local_addr = listener.local_addr()?;
         let tls = ServerTlsConfig::new()
