@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use minisign::KeyPair;
@@ -280,10 +280,23 @@ pub fn phases_for(messages: &[AgentMessage], id: &str) -> Vec<i32>
 
 pub fn process_alive(pid: u32) -> bool
 {
-    Path::new("/bin/kill").exists()
-        && std::process::Command::new("/bin/kill")
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .map(|(_, rest)| !rest.trim_start().starts_with('Z'))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
 }

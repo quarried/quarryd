@@ -13,7 +13,7 @@ pub enum SandboxError
         source: io::Error,
     },
     #[error("systemd D-Bus call failed: {0}")]
-    Systemd(#[from] zbus::Error),
+    Dbus(#[from] zbus::Error),
     #[error("firecracker API returned {status}: {body}")]
     Api
     {

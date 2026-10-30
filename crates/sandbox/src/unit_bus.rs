@@ -128,12 +128,12 @@ fn is_missing_unit(error: &zbus::Error) -> bool
 }
 
 #[derive(Clone, Debug)]
-pub struct Systemd
+pub struct UnitBus
 {
     connection: Connection,
 }
 
-impl Systemd
+impl UnitBus
 {
     pub async fn connect() -> Result<Self, SandboxError>
     {
@@ -344,7 +344,7 @@ mod tests
     #[ignore = "needs root and a systemd system bus"]
     async fn transient_unit_starts_and_stops()
     {
-        let systemd = Systemd::connect().await.unwrap();
+        let systemd = UnitBus::connect().await.unwrap();
         let name = format!("quarry-sandbox-test-{}.service", std::process::id());
         let properties = TransientServiceProperties {
             description: "quarry sandbox systemd test".into(),

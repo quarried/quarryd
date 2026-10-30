@@ -7,7 +7,7 @@ use proto::v1::{Isolation, Phase};
 use sandbox::Sandbox;
 use sandbox::firecracker::{Firecracker, FirecrackerConfig};
 use sandbox::gvisor::{Gvisor, GvisorConfig};
-use sandbox::systemd::Systemd;
+use sandbox::unit_bus::UnitBus;
 use volume::LvmThin;
 
 use super::*;
@@ -176,7 +176,7 @@ async fn firecracker_instance_runs_end_to_end()
     let mut fixture = Fixture::new().await;
     fixture.kernel = publish_file(&fixture, "QUARRY_TEST_KERNEL", "vmlinux-e2e").await;
     fixture.rootfs = publish_file(&fixture, "QUARRY_TEST_ROOTFS", "rootfs-e2e").await;
-    let systemd = Systemd::connect().await.unwrap();
+    let systemd = UnitBus::connect().await.unwrap();
     run_end_to_end(fixture, Isolation::Firecracker, |_| {
         let config = FirecrackerConfig {
             firecracker_bin: PathBuf::from(env("QUARRY_TEST_FIRECRACKER")),
@@ -197,7 +197,7 @@ async fn gvisor_instance_runs_end_to_end()
 {
     let mut fixture = Fixture::new().await;
     fixture.rootfs = publish_file(&fixture, "QUARRY_TEST_ROOTFS", "rootfs-e2e").await;
-    let systemd = Systemd::connect().await.unwrap();
+    let systemd = UnitBus::connect().await.unwrap();
     run_end_to_end(fixture, Isolation::Gvisor, |dir| {
         let config = GvisorConfig {
             runsc_bin: PathBuf::from(env("QUARRY_TEST_RUNSC")),

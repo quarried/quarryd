@@ -6,7 +6,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::console::tail_console;
 use crate::shell::{path_text, quote};
-use crate::systemd::Systemd;
+use crate::unit_bus::UnitBus;
 use crate::{SandboxError, SandboxState};
 
 pub(crate) const EXIT_STATUS_FILE: &str = "exit_status";
@@ -54,7 +54,7 @@ fn read_exit_status(exit_file: &Path) -> Option<Option<i32>>
 }
 
 pub(crate) async fn status(
-    systemd: &Systemd,
+    systemd: &UnitBus,
     unit: &str,
     exit_file: &Path,
 ) -> Result<SandboxState, SandboxError>
@@ -74,7 +74,7 @@ pub(crate) async fn status(
     })
 }
 
-pub(crate) async fn is_running(systemd: &Systemd, unit: &str) -> Result<bool, SandboxError>
+pub(crate) async fn is_running(systemd: &UnitBus, unit: &str) -> Result<bool, SandboxError>
 {
     Ok(systemd
         .unit_active_state(unit)
@@ -82,7 +82,7 @@ pub(crate) async fn is_running(systemd: &Systemd, unit: &str) -> Result<bool, Sa
         .is_some_and(|state| is_running_state(&state)))
 }
 
-pub(crate) async fn clear_stale_unit(systemd: &Systemd, unit: &str) -> Result<(), SandboxError>
+pub(crate) async fn clear_stale_unit(systemd: &UnitBus, unit: &str) -> Result<(), SandboxError>
 {
     systemd.reset_failed_unit(unit).await?;
     let deadline = Instant::now() + UNLOAD_TIMEOUT;
@@ -123,7 +123,7 @@ pub(crate) fn failure_detail(state: &str, console: &Path) -> String
 }
 
 pub(crate) async fn wait_until_active(
-    systemd: &Systemd,
+    systemd: &UnitBus,
     unit: &str,
     exit_file: &Path,
     console: &Path,
@@ -162,7 +162,7 @@ pub(crate) async fn wait_until_active(
 }
 
 pub(crate) async fn ensure_running(
-    systemd: &Systemd,
+    systemd: &UnitBus,
     unit: &str,
     console: &Path,
 ) -> Result<(), SandboxError>
@@ -177,7 +177,7 @@ pub(crate) async fn ensure_running(
     }
 }
 
-pub(crate) async fn kill_and_wait(systemd: &Systemd, unit: &str) -> Result<(), SandboxError>
+pub(crate) async fn kill_and_wait(systemd: &UnitBus, unit: &str) -> Result<(), SandboxError>
 {
     if !is_running(systemd, unit).await?
     {
@@ -203,7 +203,7 @@ pub(crate) async fn kill_and_wait(systemd: &Systemd, unit: &str) -> Result<(), S
 }
 
 pub(crate) async fn cgroup_path(
-    systemd: &Systemd,
+    systemd: &UnitBus,
     unit: &str,
 ) -> Result<Option<PathBuf>, SandboxError>
 {

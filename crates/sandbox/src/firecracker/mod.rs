@@ -12,8 +12,8 @@ use tokio::time::{Instant, sleep};
 
 use crate::error::io;
 use crate::shell::{console_script, path_text, writer_argv};
-use crate::systemd::{Systemd, TransientServiceProperties};
 use crate::unit::{self, EXIT_STATUS_FILE, blocking};
+use crate::unit_bus::{TransientServiceProperties, UnitBus};
 use crate::{
     GUEST_AGENT_PATH, GUEST_VSOCK_PORT, Sandbox, SandboxError, SandboxHandle, SandboxKind,
     SandboxRecord, SandboxSpec, SandboxState, ShutdownMode, guest_environment, persist_record,
@@ -414,12 +414,12 @@ fn pin_vcpu_threads(_pid: u32, _cpus: &[u32]) -> Result<usize, SandboxError>
 pub struct Firecracker
 {
     config: FirecrackerConfig,
-    systemd: Systemd,
+    systemd: UnitBus,
 }
 
 impl Firecracker
 {
-    pub fn new(config: FirecrackerConfig, systemd: Systemd) -> Result<Self, SandboxError>
+    pub fn new(config: FirecrackerConfig, systemd: UnitBus) -> Result<Self, SandboxError>
     {
         let exec_name = config
             .firecracker_bin
@@ -1021,7 +1021,7 @@ mod tests
     {
         let variable =
             |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
-        let systemd = Systemd::connect().await.unwrap();
+        let systemd = UnitBus::connect().await.unwrap();
         let backend = Firecracker::new(integration_config(), systemd.clone()).unwrap();
         let instance_id = format!("fc-test-{}", std::process::id());
         let mut spec = sample_spec(&instance_id);
@@ -1062,7 +1062,7 @@ mod tests
         assert_eq!(again.record().pid, record.pid);
 
         let restarted =
-            Firecracker::new(integration_config(), Systemd::connect().await.unwrap()).unwrap();
+            Firecracker::new(integration_config(), UnitBus::connect().await.unwrap()).unwrap();
         let adopted = restarted.adopt(&record).await.unwrap().unwrap();
         assert_eq!(adopted.record().pid, record.pid);
 

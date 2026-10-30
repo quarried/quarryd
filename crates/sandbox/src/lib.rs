@@ -11,8 +11,8 @@ pub mod fake;
 pub mod firecracker;
 pub mod gvisor;
 mod shell;
-pub mod systemd;
 mod unit;
+pub mod unit_bus;
 
 pub use error::SandboxError;
 

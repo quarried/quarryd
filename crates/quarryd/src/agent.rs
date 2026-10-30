@@ -81,7 +81,7 @@ async fn build_sandbox(config: &Config) -> Result<Arc<dyn Sandbox>>
     {
         SandboxBackend::Firecracker =>
         {
-            let systemd = sandbox::systemd::Systemd::connect()
+            let systemd = sandbox::unit_bus::UnitBus::connect()
                 .await
                 .context("connecting to systemd")?;
             Arc::new(sandbox::firecracker::Firecracker::new(
@@ -98,7 +98,7 @@ async fn build_sandbox(config: &Config) -> Result<Arc<dyn Sandbox>>
         }
         SandboxBackend::Gvisor =>
         {
-            let systemd = sandbox::systemd::Systemd::connect()
+            let systemd = sandbox::unit_bus::UnitBus::connect()
                 .await
                 .context("connecting to systemd")?;
             Arc::new(sandbox::gvisor::Gvisor::new(
@@ -347,7 +347,7 @@ impl Agent
         }
         else
         {
-            sandbox::systemd::Systemd::connect().await.ok()
+            sandbox::unit_bus::UnitBus::connect().await.ok()
         };
         let updater = Arc::new(Updater::new(
             UpdatePaths::new(config.update.binary_path.clone(), &config.state_dir),

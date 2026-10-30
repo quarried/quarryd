@@ -15,8 +15,8 @@ use tokio::time::{Instant, sleep};
 
 use crate::error::io;
 use crate::shell::{console_script, join, path_text, quote, writer_argv};
-use crate::systemd::{Systemd, TransientServiceProperties};
 use crate::unit::{self, EXIT_STATUS_FILE, blocking};
+use crate::unit_bus::{TransientServiceProperties, UnitBus};
 use crate::{
     GUEST_AGENT_PATH, Sandbox, SandboxError, SandboxHandle, SandboxKind, SandboxRecord,
     SandboxSpec, SandboxState, ShutdownMode, guest_environment, persist_record,
@@ -405,12 +405,12 @@ struct ContainerState
 pub struct Gvisor
 {
     config: GvisorConfig,
-    systemd: Systemd,
+    systemd: UnitBus,
 }
 
 impl Gvisor
 {
-    pub fn new(config: GvisorConfig, systemd: Systemd) -> Result<Self, SandboxError>
+    pub fn new(config: GvisorConfig, systemd: UnitBus) -> Result<Self, SandboxError>
     {
         if config.console_writer.is_empty()
         {
@@ -941,7 +941,7 @@ mod tests
             .unwrap();
         let backend = Gvisor::new(
             integration_config(base.path().to_path_buf()),
-            Systemd::connect().await.unwrap(),
+            UnitBus::connect().await.unwrap(),
         )
         .unwrap();
         let instance_id = format!("gv-test-{}", std::process::id());
@@ -985,7 +985,7 @@ mod tests
 
         let restarted = Gvisor::new(
             integration_config(base.path().to_path_buf()),
-            Systemd::connect().await.unwrap(),
+            UnitBus::connect().await.unwrap(),
         )
         .unwrap();
         let adopted = restarted.adopt(&record).await.unwrap().unwrap();

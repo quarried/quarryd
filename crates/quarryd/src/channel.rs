@@ -260,11 +260,9 @@ impl ControlChannel
                 }
                 result = self.operations.next_result() => {
                     if let Some(result) = result
+                        && let Err(error) = self.send_numbered(AgentBody::OpResult(result), &sender).await
                     {
-                        if let Err(error) = self.send_numbered(AgentBody::OpResult(result), &sender).await
-                        {
-                            return Disconnect::Stream(error);
-                        }
+                        return Disconnect::Stream(error);
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -275,14 +273,12 @@ impl ControlChannel
                 }
                 _ = rotation_check.tick() => {
                     if let Ok(Some(current)) = self.transport.identity()
+                        && current.needs_rotation(crate::identity::now_unix())
                     {
-                        if current.needs_rotation(crate::identity::now_unix())
+                        match self.transport.enroll(endpoint, Some(&current), "").await
                         {
-                            match self.transport.enroll(endpoint, Some(&current), "").await
-                            {
-                                Ok(_) => return Disconnect::Stream(anyhow!("certificate rotated; reconnecting with the new identity")),
-                                Err(error) => warn!(error = %format!("{error:#}"), "certificate rotation failed"),
-                            }
+                            Ok(_) => return Disconnect::Stream(anyhow!("certificate rotated; reconnecting with the new identity")),
+                            Err(error) => warn!(error = %format!("{error:#}"), "certificate rotation failed"),
                         }
                     }
                 }

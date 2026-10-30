@@ -31,7 +31,7 @@ async fn put_instance_reaches_running_through_the_provisioning_sequence()
         unreachable!()
     };
     assert_eq!(hello.node_id, "node-test");
-    assert!(hello.capabilities.unwrap().isolations.len() >= 1);
+    assert!(!hello.capabilities.unwrap().isolations.is_empty());
     assert_eq!(harness.control.enrollments().await.len(), 1);
 
     harness.control.put_instance(harness.spec("mc-1", 1)).await;

@@ -117,7 +117,7 @@ async fn rollback(binary: PathBuf, marker: PathBuf, delay: Duration, service: St
         return Ok(());
     }
     println!("new agent version did not connect in time; restored the previous binary");
-    let systemd = sandbox::systemd::Systemd::connect()
+    let systemd = sandbox::unit_bus::UnitBus::connect()
         .await
         .context("connecting to systemd")?;
     systemd

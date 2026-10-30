@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, watch};
 use tracing::{error, info, warn};
 use volume::{ArtifactDescriptor, ArtifactKind, ImageCache};
 
-use sandbox::systemd::{Systemd, TransientServiceProperties};
+use sandbox::unit_bus::{TransientServiceProperties, UnitBus};
 
 pub const ROLLBACK_UNIT: &str = "quarryd-rollback.service";
 
@@ -47,7 +47,7 @@ pub struct Updater
     paths: UpdatePaths,
     current_version: String,
     images: Option<Arc<ImageCache>>,
-    systemd: Option<Systemd>,
+    systemd: Option<UnitBus>,
     service_name: String,
     rollback_after: Duration,
     restart: Arc<watch::Sender<bool>>,
@@ -130,7 +130,7 @@ impl Updater
         paths: UpdatePaths,
         current_version: String,
         images: Option<Arc<ImageCache>>,
-        systemd: Option<Systemd>,
+        systemd: Option<UnitBus>,
         service_name: String,
         rollback_after: Duration,
         restart: Arc<watch::Sender<bool>>,
@@ -257,11 +257,9 @@ impl Updater
                     warn!(error = %error, "failed to remove the update marker");
                 }
                 if let Some(systemd) = &self.systemd
+                    && let Err(error) = systemd.stop_unit(ROLLBACK_UNIT).await
                 {
-                    if let Err(error) = systemd.stop_unit(ROLLBACK_UNIT).await
-                    {
-                        warn!(error = %error, "failed to stop the rollback watchdog");
-                    }
+                    warn!(error = %error, "failed to stop the rollback watchdog");
                 }
             }
             Ok(None) =>

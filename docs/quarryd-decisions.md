@@ -117,3 +117,24 @@
 - 11 | Balloon idle reclaim amount? | Half of memory_mib; unsupported backends log once | Opt-in low-tier reclaim.
 - 4.9 | Usage source errors? | The sample is skipped | Nothing is counted twice; deltas catch up on the next sample.
 - 4.4 | Sandbox status polling? | Every 500 ms | Prompt crash detection.
+- 13 | Configuration format? | TOML at /etc/quarryd/quarryd.toml, parsed with serde; https endpoints and loopback metrics address enforced at load | Section 10 requires mTLS only and localhost-only metrics.
+- 2 | Backend selection? | sandbox.backend = auto picks Firecracker when /dev/kvm exists, otherwise gVisor; capabilities report kvm, isolations, arch, and the WireGuard key | Section 2: detect at startup and report in Hello.capabilities.
+- 11 | Node capacity? | [capacity] from config, otherwise detected (CPU count, /proc/meminfo, thin-pool size) | Allocatable = capacity − reservation per section 11.
+- 4.1 | Reconnect backoff? | 500 ms × 2^attempt with 50–100 % jitter, capped at 30 s, reset after a connection lasts 30 s; endpoints tried round-robin | Section 4.1.
+- 4.1 | Heartbeat and lease renewal cadence? | Every min(10 s, lease TTL / 3) | Leases must be renewed well before the TTL.
+- 4.1 | Agent-side replay buffer? | Unacked numbered messages kept in memory; a newer status for an instance replaces the older unacked one; on reconnect queued status events are discarded and a fresh status for every instance is sent | Status is level-triggered and must not arrive out of order.
+- 4.1 | When is a control message acknowledged? | After its effect is persisted (desired spec in SQLite, op_id recorded) and the watermark stored in kv | A crash after the ack cannot lose the message.
+- 4.3 | Replayed op_id still running? | No second run; the result is sent when it finishes | Section 4.3.
+- 4.3 | Operations interrupted by an agent restart? | Marked failed on startup with "interrupted by an agent restart" | The stored result answers later replays.
+- 4.3 | Drain? | Node-level: admission refuses new instances and heartbeats report draining | The operation carries no instance semantics in the spec.
+- 4.3 | StreamLogs? | Reads the console ring and uploads it through the StreamLogs RPC; follow mode polls every 500 ms until the control plane closes the stream or the instance is gone | Large data uses separate RPCs per section 4.1.
+- 10 | Certificate rotation? | Checked every 10 minutes; re-enroll with the current certificate when less than 8 h of the 24 h validity remains, then reconnect | Section 10: short-lived, auto-rotated certificates.
+- 10 | TLS settings? | rustls with TLS 1.3 only, the pinned CA as the only root, ALPN h2, ring crypto provider | Section 10: mTLS only, pinned CA, TLS 1.3.
+- 10 | Key storage? | node.key written 0600 via atomic rename under state_dir/identity | Private key protection.
+- 9 | Self-update mechanics? | Download through the ImageCache (digest and minisign verified), keep the old binary as <binary>.prev, write update-pending.json, swap atomically, start transient unit quarryd-rollback.service running `<prev> rollback --delay-secs N`, then exit; the new binary removes the marker and stops the watchdog after its first successful connection | Section 9: verified atomic swap with watchdog rollback after N minutes.
+- 9 | Rollback window? | update.rollback_after_secs, default 600 | Section 9 leaves N open.
+- 9 | Does stopping quarryd stop instances? | No; SIGTERM stops quarryd's tasks only | Section 9.
+- 4.4 | Who writes the console ring? | `quarryd console-ring --path P --max-bytes N` runs inside each instance unit reading the VMM's output | The writer must outlive quarryd restarts.
+- 10 | Unit hardening? | quarryd.service with ProtectSystem=strict, explicit ReadWritePaths, a reduced CapabilityBoundingSet, KillMode=process, Restart=always | Section 10.
+- 12 | Log format? | JSON lines on stdout (journald) with node_id injected into every line and instance spans carrying instance_id; level from QUARRYD_LOG | Section 12.
+- 12 | Metrics endpoint default? | 127.0.0.1:9478 | Localhost only.
