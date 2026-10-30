@@ -60,4 +60,40 @@ mod tests
         assert_eq!(Phase::Running.to_string(), "RUNNING");
         assert_eq!(Phase::Rejected.to_string(), "REJECTED");
     }
+    #[test]
+    fn health_wake_and_live_use_assigned_wire_tags()
+    {
+        use super::v1::{InstanceHealth, LiveMetrics, WakeRequest};
+        let health = AgentMessage {
+            seq: 0,
+            ack: 0,
+            body: Some(agent_message::Body::Health(InstanceHealth {
+                instance_id: "i".into(),
+                cpu_usec_total: 9001,
+                ..Default::default()
+            })),
+        };
+        let bytes = health.encode_to_vec();
+        assert_eq!(&bytes[..2], &[0x82, 0x01]);
+        assert_eq!(AgentMessage::decode(bytes.as_slice()).unwrap(), health);
+        let wake = AgentMessage {
+            body: Some(agent_message::Body::Wake(WakeRequest {
+                instance_id: "i".into(),
+                requested_at_unix_ms: 42,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(&wake.encode_to_vec()[..2], &[0x8a, 0x01]);
+        let live = ControlMessage {
+            seq: 1,
+            body: Some(control_message::Body::Live(LiveMetrics {
+                instance_id: "i".into(),
+                until_unix_ms: 42,
+            })),
+            ..Default::default()
+        };
+        let bytes = live.encode_to_vec();
+        assert!(bytes.windows(2).any(|w| w == [0x8a, 0x01]));
+        assert_eq!(ControlMessage::decode(bytes.as_slice()).unwrap(), live);
+    }
 }

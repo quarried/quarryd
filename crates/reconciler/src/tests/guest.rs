@@ -242,116 +242,118 @@ async fn session(
         let crash_sleep =
             tokio::time::sleep_until(crash_at.unwrap_or_else(|| Instant::now() + MAX_LIFETIME));
         tokio::select! {
-            frame = read_frame(&mut read, MAX_HOST_FRAME_BYTES) =>
-            {
-                let bytes = match frame
-                {
-                    Ok(Some(bytes)) => bytes,
-                    _ => return SessionEnd::Disconnected,
-                };
-                let message = match decode_with_default_command(&bytes)
-                {
-                    Ok(message) => message,
-                    Err(error) =>
-                    {
-                        trace(&format!("invalid host message {error}"));
-                        continue;
-                    }
-                };
-                match message.body
-                {
-                    Some(HostBody::Configure(configure)) =>
-                    {
-                        let mut secrets: Vec<String> = configure
-                            .secrets
-                            .iter()
-                            .map(|(name, value)| format!("{name}={}", String::from_utf8_lossy(value)))
-                            .collect();
-                        secrets.sort();
-                        trace(&format!(
-                            "configure {} memory={} secrets=[{}]",
-                            configure.generation,
-                            configure.memory_mib,
-                            secrets.join(",")
-                        ));
-                        *configured = true;
-                        if mode == "never-ready"
-                        {
-                            continue;
-                        }
-                        if !send(&mut write, ready()).await
-                        {
-                            return SessionEnd::Disconnected;
-                        }
-                        trace("ready");
-                        if let Some(after) = crash_after
-                        {
-                            crash_at = Some(Instant::now() + after);
-                        }
-                        if mode == "flood"
-                        {
-                            let spam = GuestBody::Log(Log { line: "spam".to_owned() });
-                            while send(&mut write, spam.clone()).await
-                            {}
-                            return SessionEnd::Disconnected;
-                        }
-                    }
-                    Some(HostBody::Shutdown(shutdown)) =>
-                    {
-                        trace(&format!("shutdown {}", shutdown.deadline_ms));
-                        if mode == "ignore-shutdown"
-                        {
-                            continue;
-                        }
-                        let _ = send(
-                            &mut write,
-                            GuestBody::ShutdownComplete(ShutdownComplete { exit_code: 0 }),
-                        )
-                        .await;
-                        return SessionEnd::Exit(0);
-                    }
-                    Some(HostBody::PrepareSnapshot(_)) =>
-                    {
-                        trace("prepare-snapshot");
-                        let prepared = GuestBody::SnapshotPrepared(SnapshotPrepared {
-                            ok: true,
-                            error: String::new(),
-                        });
-                        if !send(&mut write, prepared).await
-                        {
-                            return SessionEnd::Disconnected;
-                        }
-                    }
-                    Some(HostBody::ResumeWrites(_)) => trace("resume-writes"),
-                    Some(HostBody::ConsoleCommand(command)) =>
-                    {
-                        trace(&format!("console {}", command.command));
-                    }
-                    None =>
-                    {}
-                }
-            }
-            _ = health.tick(), if *configured && mode != "never-ready" =>
-            {
-                let report = GuestBody::Health(Health {
-                    tps: 20.0,
-                    mspt: 5.0,
-                    players,
-                    heap_used_bytes: 1 << 20,
-                });
-                if !send(&mut write, report).await
-                {
-                    return SessionEnd::Disconnected;
-                }
-                if path.parent().is_some_and(|parent| !parent.exists())
-                {
-                    return SessionEnd::Exit(0);
-                }
-            }
-            _ = crash_sleep, if crash_at.is_some() =>
-            {
-                return SessionEnd::Exit(3);
-            }
-        }
+                   frame = read_frame(&mut read, MAX_HOST_FRAME_BYTES) =>
+                   {
+                       let bytes = match frame
+                       {
+                           Ok(Some(bytes)) => bytes,
+                           _ => return SessionEnd::Disconnected,
+                       };
+                       let message = match decode_with_default_command(&bytes)
+                       {
+                           Ok(message) => message,
+                           Err(error) =>
+                           {
+                               trace(&format!("invalid host message {error}"));
+                               continue;
+                           }
+                       };
+                       match message.body
+                       {
+                           Some(HostBody::Configure(configure)) =>
+                           {
+                               let mut secrets: Vec<String> = configure
+                                   .secrets
+                                   .iter()
+                                   .map(|(name, value)| format!("{name}={}", String::from_utf8_lossy(value)))
+                                   .collect();
+                               secrets.sort();
+                               trace(&format!(
+                                   "configure {} memory={} secrets=[{}]",
+                                   configure.generation,
+                                   configure.memory_mib,
+                                   secrets.join(",")
+                               ));
+                               *configured = true;
+                               if mode == "never-ready"
+                               {
+                                   continue;
+                               }
+                               if !send(&mut write, ready()).await
+                               {
+                                   return SessionEnd::Disconnected;
+                               }
+                               trace("ready");
+                               if let Some(after) = crash_after
+                               {
+                                   crash_at = Some(Instant::now() + after);
+                               }
+                               if mode == "flood"
+                               {
+                                   let spam = GuestBody::Log(Log { line: "spam".to_owned() });
+                                   while send(&mut write, spam.clone()).await
+                                   {}
+                                   return SessionEnd::Disconnected;
+                               }
+                           }
+                           Some(HostBody::Shutdown(shutdown)) =>
+                           {
+                               trace(&format!("shutdown {}", shutdown.deadline_ms));
+                               if mode == "ignore-shutdown"
+                               {
+                                   continue;
+                               }
+                               let _ = send(
+                                   &mut write,
+                                   GuestBody::ShutdownComplete(ShutdownComplete { exit_code: 0 }),
+                               )
+                               .await;
+                               return SessionEnd::Exit(0);
+                           }
+                           Some(HostBody::PrepareSnapshot(_)) =>
+                           {
+                               trace("prepare-snapshot");
+                               let prepared = GuestBody::SnapshotPrepared(SnapshotPrepared {
+                                   ok: true,
+                                   error: String::new(),
+                               });
+                               if !send(&mut write, prepared).await
+                               {
+                                   return SessionEnd::Disconnected;
+                               }
+                           }
+                           Some(HostBody::ResumeWrites(_)) => trace("resume-writes"),
+                           Some(HostBody::ConsoleCommand(command)) =>
+                           {
+                               trace(&format!("console {}", command.command));
+                               let _ = send(&mut write, GuestBody::ConsoleOutput(guest_proto::ConsoleOutput { request_id: command.request_id, lines: vec![command.command] })).await;
+                           }
+                           None =>
+                           {}
+                       }
+                   }
+                   _ = health.tick(), if *configured && mode != "never-ready" =>
+                   {
+                       let report = GuestBody::Health(Health {
+                           tps: 20.0,
+                           mspt: 5.0,
+                           players,
+                           heap_used_bytes: 1 << 20,
+        ..Default::default()
+        });
+                       if !send(&mut write, report).await
+                       {
+                           return SessionEnd::Disconnected;
+                       }
+                       if path.parent().is_some_and(|parent| !parent.exists())
+                       {
+                           return SessionEnd::Exit(0);
+                       }
+                   }
+                   _ = crash_sleep, if crash_at.is_some() =>
+                   {
+                       return SessionEnd::Exit(3);
+                   }
+               }
     }
 }

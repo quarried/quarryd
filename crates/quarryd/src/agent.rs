@@ -162,7 +162,9 @@ fn build_network(config: &Config) -> Result<Arc<dyn Network>>
 fn host_network(config: &Config) -> Result<Arc<dyn Network>>
 {
     let mut networking = network::NetworkingConfig::new(config.state_dir.join("network"));
-    networking.uplink_ifname = config.network.uplink.clone();
+    networking.uplink_ifname = (!config.uplink_interface.is_empty())
+        .then(|| config.uplink_interface.clone())
+        .or_else(|| config.network.uplink.clone());
     Ok(Arc::new(network::Networking::new(networking)?))
 }
 
@@ -276,6 +278,13 @@ impl Agent
         let kind = sandbox.kind();
         let volumes = Arc::new(Volumes::new(build_volume(&config)));
         let network = build_network(&config)?;
+        network
+            .configure_public(&network::PublicIpv4Config {
+                pool: config.public_ipv4_pool.clone(),
+                uplink_interface: config.uplink_interface.clone(),
+                arp: config.public_ipv4_arp,
+            })
+            .await?;
         let wireguard_public_key = match network.wireguard_public_key().await
         {
             Ok(key) => key.unwrap_or_default(),
@@ -370,6 +379,8 @@ impl Agent
                     isolations: isolations(kind),
                     arch: std::env::consts::ARCH.to_string(),
                     wireguard_public_key,
+                    public_ipv4_pool: config.public_ipv4_pool.clone(),
+                    uplink_interface: config.uplink_interface.clone(),
                 },
                 heartbeat_interval: heartbeat_interval(config.lease_ttl()),
             },

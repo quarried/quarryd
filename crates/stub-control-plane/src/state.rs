@@ -253,6 +253,8 @@ fn agent_kind(body: &Option<agent_message::Body>) -> &'static str
         Some(agent_message::Body::Usage(_)) => "usage",
         Some(agent_message::Body::OpResult(_)) => "op_result",
         Some(agent_message::Body::Lease(_)) => "lease",
+        Some(agent_message::Body::Health(_)) => "health",
+        Some(agent_message::Body::Wake(_)) => "wake",
     }
 }
 
@@ -268,5 +270,6 @@ fn control_kind(body: &Option<control_message::Body>) -> &'static str
         Some(control_message::Body::Lease(_)) => "lease",
         Some(control_message::Body::Update(_)) => "update",
         Some(control_message::Body::Desired(_)) => "desired",
+        Some(control_message::Body::Live(_)) => "live",
     }
 }

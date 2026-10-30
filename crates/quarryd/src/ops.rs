@@ -149,17 +149,20 @@ async fn execute(
     {
         Some(Kind::Snapshot(snapshot)) =>
         {
-            let manifest_key = reconciler
-                .snapshot_now(&op.instance_id, &snapshot.destination_prefix)
+            let (manifest_key, size_bytes, disk) = reconciler
+                .snapshot_details(&op.instance_id, &snapshot.destination_prefix)
                 .await?;
-            Ok((manifest_key.clone(), manifest_key.into_bytes()))
+            let payload = serde_json::to_vec(
+                &serde_json::json!({"manifests": {disk: &manifest_key}, "size_bytes": size_bytes}),
+            )?;
+            Ok((manifest_key, payload))
         }
         Some(Kind::Console(console)) =>
         {
-            reconciler
-                .send_console_command(&op.instance_id, &console.command)
+            let lines = reconciler
+                .console_output(&op.instance_id, &op.op_id, &console.command)
                 .await?;
-            Ok(("sent".to_string(), Vec::new()))
+            Ok(("completed".to_string(), lines.join("\n").into_bytes()))
         }
         Some(Kind::Drain(drain)) =>
         {
@@ -226,7 +229,7 @@ async fn stream_logs(
         data: data.to_vec(),
         eof,
     };
-    let mut closed = false;
+    let mut closed = sender.send(chunk(&[], false)).await.is_err();
     for piece in initial[start..].chunks(LOG_CHUNK_BYTES)
     {
         if sender.send(chunk(piece, false)).await.is_err()
@@ -239,6 +242,10 @@ async fn stream_logs(
     while follow && !closed
     {
         tokio::time::sleep(LOG_FOLLOW_POLL).await;
+        if upload.is_finished()
+        {
+            break;
+        }
         let current = sandbox::console::read_console(&path)?;
         let fresh = new_console_bytes(&last_snapshot, &current, seen);
         seen = current.len();

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use network::{
     AttachMode, InstanceNetworkSpec, InterfaceNames, Network, NetworkAttachment, Networking,
-    NetworkingConfig, NodeNetwork, Subnet, WireGuardPeerConfig, guest_mac, nft,
+    NetworkingConfig, NodeNetwork, PublicIpMode, PublicIpv4Arp, PublicIpv4Config, Subnet,
+    WireGuardPeerConfig, guest_mac, nft,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -579,4 +580,291 @@ async fn same_world_instances_can_talk_and_other_worlds_cannot()
         networking.detach(&instance.instance_id).await.unwrap();
     }
     assert!(set_elements(&nft::world_set_name("world-one", "it-iso-a")).is_empty());
+}
+
+async fn python_in(netns: &str, script: &str) -> String
+{
+    let output = tokio::process::Command::new("ip")
+        .args(["netns", "exec", netns, "python3", "-c", script])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+async fn python_listener(netns: &str, script: &str) -> tokio::process::Child
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut child = tokio::process::Command::new("ip")
+        .args(["netns", "exec", netns, "python3", "-u", "-c", script])
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    child
+}
+
+#[tokio::test]
+#[ignore = "needs root, Linux network namespaces, nftables, iproute2 and Python 3"]
+async fn public_nat_proxy_sleep_and_crash_recovery_use_real_packets()
+{
+    let _host = HOST.lock().await;
+    let state = tempfile::tempdir().unwrap();
+    let client = "quarry-public-client";
+    let uplink = "qp-test0";
+    let peer = "qp-peer";
+    run_ok("ip", &["netns", "add", client]);
+    run_ok(
+        "ip",
+        &["link", "add", uplink, "type", "veth", "peer", "name", peer],
+    );
+    run_ok("ip", &["link", "set", peer, "netns", client]);
+    run_ok("ip", &["addr", "add", "192.0.2.1/24", "dev", uplink]);
+    run_ok("ip", &["link", "set", uplink, "up"]);
+    run_ok(
+        "ip",
+        &["-n", client, "addr", "add", "192.0.2.2/24", "dev", peer],
+    );
+    run_ok("ip", &["-n", client, "link", "set", peer, "up"]);
+    run_ok("ip", &["-n", client, "link", "set", "lo", "up"]);
+    run_ok(
+        "ip",
+        &[
+            "-n",
+            client,
+            "route",
+            "add",
+            "203.0.113.9/32",
+            "via",
+            "192.0.2.1",
+        ],
+    );
+    let mut networking_config = NetworkingConfig::new(state.path().to_path_buf());
+    networking_config.uplink_ifname = Some(uplink.to_string());
+    let public = PublicIpv4Config {
+        pool: vec!["203.0.113.9".to_string()],
+        uplink_interface: uplink.to_string(),
+        arp: PublicIpv4Arp::Routed,
+    };
+    let network = Networking::new(networking_config.clone()).unwrap();
+    network.configure_public(&public).await.unwrap();
+    network.configure_node(&node()).await.unwrap();
+    let mut guest = spec("it-public", "public-world", 61, AttachMode::Veth);
+    guest.ports.clear();
+    let names = InterfaceNames::for_instance(&guest.instance_id);
+    network.attach(&guest).await.unwrap();
+    network
+        .attach_public(&guest.instance_id, "203.0.113.9".parse().unwrap())
+        .await
+        .unwrap();
+    network
+        .set_public_mode(&guest.instance_id, PublicIpMode::Running)
+        .await
+        .unwrap();
+    assert!(!run_ok("ip", &["neigh", "show", "proxy", "dev", uplink]).contains("203.0.113.9"));
+    let mut guest_server = python_listener(
+        &names.netns,
+        r#"
+import socket
+tcp = socket.socket()
+tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+tcp.bind(('10.231.0.61', 24444))
+tcp.listen(1)
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.bind(('10.231.0.61', 24445))
+tcp.settimeout(5)
+udp.settimeout(5)
+print('ready')
+conn, peer = tcp.accept()
+with conn:
+    conn.sendall(peer[0].encode())
+data, peer = udp.recvfrom(1024)
+udp.sendto(peer[0].encode(), peer)
+"#,
+    )
+    .await;
+    python_in(
+        client,
+        r#"
+import socket
+with socket.create_connection(('203.0.113.9', 24444), 3) as tcp:
+    assert tcp.recv(128) == b'192.0.2.2'
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+    udp.settimeout(3)
+    udp.sendto(b'query', ('203.0.113.9', 24445))
+    assert udp.recv(128) == b'192.0.2.2'
+"#,
+    )
+    .await;
+    assert!(guest_server.wait().await.unwrap().success());
+
+    let mut outside_server = python_listener(
+        client,
+        r#"
+import socket
+with socket.socket() as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('192.0.2.2', 24446))
+    server.listen(1)
+    server.settimeout(5)
+    print('ready')
+    conn, peer = server.accept()
+    with conn:
+        conn.sendall(peer[0].encode())
+"#,
+    )
+    .await;
+    python_in(
+        &names.netns,
+        r#"
+import socket
+with socket.create_connection(('192.0.2.2', 24446), 3) as stream:
+    assert stream.recv(128) == b'203.0.113.9'
+"#,
+    )
+    .await;
+    assert!(outside_server.wait().await.unwrap().success());
+
+    let public = PublicIpv4Config {
+        arp: PublicIpv4Arp::Proxy,
+        ..public
+    };
+    network.configure_public(&public).await.unwrap();
+    assert!(run_ok("ip", &["neigh", "show", "proxy", "dev", uplink]).contains("203.0.113.9"));
+    run_ok(
+        "ip",
+        &[
+            "-n",
+            client,
+            "route",
+            "replace",
+            "203.0.113.9/32",
+            "dev",
+            peer,
+        ],
+    );
+    network
+        .set_public_mode(&guest.instance_id, PublicIpMode::Hibernated)
+        .await
+        .unwrap();
+    let mut wakes = network.subscribe_wakes();
+    let response = python_in(
+        client,
+        r#"
+import json, socket, struct
+def exact(stream, length):
+    result = b''
+    while len(result) < length:
+        chunk = stream.recv(length - len(result))
+        assert chunk
+        result += chunk
+    return result
+def varint(stream):
+    result = 0
+    for shift in range(0, 35, 7):
+        byte = exact(stream, 1)[0]
+        result |= (byte & 127) << shift
+        if not byte & 128:
+            return result
+    raise AssertionError('varint too long')
+with socket.create_connection(('203.0.113.9', 25565), 3) as stream:
+    stream.sendall(b'\x10\x00\x81\x06\x09localhost\x63\xdd\x01\x01\x00')
+    varint(stream)
+    assert exact(stream, 1) == b'\x00'
+    status = json.loads(exact(stream, varint(stream)))
+    assert 'sleeping' in status['description']['text']
+    ping = b'\x01' + struct.pack('>q', 123456)
+    stream.sendall(b'\x09' + ping)
+    assert exact(stream, varint(stream)) == ping
+with socket.create_connection(('203.0.113.9', 25565), 3) as stream:
+    stream.sendall(b'\x10\x00\x81\x06\x09localhost\x63\xdd\x02')
+    varint(stream)
+    assert exact(stream, 1) == b'\x00'
+    assert '30 seconds' in json.loads(exact(stream, varint(stream)))['text']
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+    udp.settimeout(.25)
+    udp.sendto(b'query', ('203.0.113.9', 25565))
+    try:
+        udp.recv(128)
+        raise AssertionError('sleeping UDP must be dropped')
+    except socket.timeout:
+        pass
+print('ok')
+"#,
+    )
+    .await;
+    assert_eq!(response.trim(), "ok");
+    assert_eq!(wakes.try_recv().unwrap().instance_id, guest.instance_id);
+    assert_eq!(network.public_metrics().wake_requests, 1);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(state.path().join("network-state.json")).unwrap())
+            .unwrap();
+    let port = saved["public"]["bindings"][&guest.instance_id]["responder_port"]
+        .as_u64()
+        .unwrap();
+    python_in(
+        client,
+        &format!(
+            r#"
+import socket
+try:
+    socket.create_connection(('192.0.2.1', {port}), .25)
+    raise AssertionError('direct responder port must be blocked')
+except socket.timeout:
+    pass
+"#
+        ),
+    )
+    .await;
+    drop(network);
+    tokio::task::yield_now().await;
+    let mut failed_config = networking_config.clone();
+    failed_config.nft_bin = "/bin/false".into();
+    let failed = Networking::new(failed_config).unwrap();
+    assert!(
+        failed
+            .set_public_mode(&guest.instance_id, PublicIpMode::Running)
+            .await
+            .is_err()
+    );
+    drop(failed);
+    tokio::task::yield_now().await;
+    let recovered = Networking::new(networking_config).unwrap();
+    recovered.configure_public(&public).await.unwrap();
+    recovered.configure_node(&node()).await.unwrap();
+    let rules_before = rule_count("inet", nft::PUBLIC_DNAT_CHAIN);
+    recovered
+        .attach_public(&guest.instance_id, "203.0.113.9".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rule_count("inet", nft::PUBLIC_DNAT_CHAIN), rules_before);
+    assert!(
+        nft_objects("inet", None)
+            .iter()
+            .filter_map(|entry| entry.get("rule"))
+            .any(|rule| rule["chain"] == nft::PUBLIC_DNAT_CHAIN
+                && rule.to_string().contains("dnat")
+                && rule.to_string().contains("10.231.0.61"))
+    );
+    recovered.detach(&guest.instance_id).await.unwrap();
+    recovered.detach(&guest.instance_id).await.unwrap();
+    recovered.detach_public(&guest.instance_id).await.unwrap();
+    assert_eq!(rule_count("inet", nft::PUBLIC_DNAT_CHAIN), 0);
+    assert!(!run_ok("ip", &["neigh", "show", "proxy", "dev", uplink]).contains("203.0.113.9"));
+    assert!(!link_exists(&names.host_veth, None));
+    run_ok("ip", &["link", "del", uplink]);
+    run_ok("ip", &["netns", "del", client]);
 }

@@ -682,3 +682,34 @@ fn store_is_usable_across_threads()
     }
     assert_eq!(store.usage_depth().unwrap(), 100);
 }
+
+#[test]
+fn disk_inventory_is_durable_and_idempotent()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disks.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store.remember_disk("instance-1", "instance-1-old").unwrap();
+        store.remember_disk("instance-1", "instance-1-old").unwrap();
+        store.remember_disk("instance-1", "instance-1-new").unwrap();
+        store
+            .remember_disk("instance-2", "instance-2-data")
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.instance_disks("instance-1").unwrap(),
+        vec!["instance-1-new", "instance-1-old"]
+    );
+    store.forget_disk("instance-1", "instance-1-old").unwrap();
+    store.forget_disk("instance-1", "instance-1-old").unwrap();
+    assert_eq!(
+        store.instance_disks("instance-1").unwrap(),
+        vec!["instance-1-new"]
+    );
+    assert_eq!(
+        store.instance_disks("instance-2").unwrap(),
+        vec!["instance-2-data"]
+    );
+}

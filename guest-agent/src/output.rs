@@ -78,7 +78,7 @@ fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>)
     }
 }
 
-fn without_color_codes(line: &str) -> String
+pub fn without_color_codes(line: &str) -> String
 {
     let mut plain = String::with_capacity(line.len());
     let mut chars = line.chars();
@@ -162,6 +162,12 @@ pub fn tps(line: &str) -> Option<TpsReading>
         tps: leading_number(value)?,
         mspt,
     })
+}
+
+pub fn last_tick(line: &str) -> Option<f64>
+{
+    let (_, last) = line.split_once("(last ")?;
+    leading_number(last)
 }
 
 pub fn ready_patterns(configured: Option<&str>, process: Option<&str>) -> Vec<String>

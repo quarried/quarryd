@@ -577,6 +577,7 @@ mod tests
                         world_id: String::new(),
                         egress_mbit: 0,
                         ports: vec![70000],
+                        ..Default::default()
                     }),
                     ..spec("a", 1, 1, 1)
                 },

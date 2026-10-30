@@ -9,7 +9,7 @@ use std::time::Duration;
 use guest_proto::MAX_LOG_LINE_BYTES;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent::Event;
@@ -28,7 +28,7 @@ const MAX_RAW_LINE_BYTES: usize = MAX_LOG_LINE_BYTES * 4;
 pub struct Server
 {
     pid: u32,
-    commands: mpsc::Sender<String>,
+    commands: mpsc::Sender<(String, Option<oneshot::Sender<io::Result<()>>>)>,
     signals: mpsc::Sender<Signal>,
 }
 
@@ -48,10 +48,22 @@ impl Server
 
     pub fn command(&self, line: &str)
     {
-        if self.commands.try_send(format!("{line}\n")).is_err()
+        if self.commands.try_send((format!("{line}\n"), None)).is_err()
         {
             log!("server console input is full or closed; dropping a command");
         }
+    }
+
+    pub async fn console_command(&self, line: &str) -> io::Result<()>
+    {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .try_send((format!("{line}\n"), Some(reply)))
+            .map_err(|_| io::Error::other("server console input is full or closed"))?;
+        tokio::time::timeout(Duration::from_millis(500), result)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server console write timed out"))?
+            .map_err(|_| io::Error::other("server console input closed"))?
     }
 
     pub fn interrupt(&self)
@@ -151,7 +163,7 @@ pub fn spawn(
     tokio::spawn(feed_console(stdin, pending_commands));
     let readers = [
         tokio::spawn(read_lines(stdout, events.clone())),
-        tokio::spawn(read_lines(stderr, events.clone())),
+        tokio::spawn(read_lines_source(stderr, events.clone(), false)),
     ];
     let (signals, pending_signals) = mpsc::channel(SIGNAL_QUEUE);
     tokio::spawn(supervise(child, readers, pending_signals, events));
@@ -162,18 +174,29 @@ pub fn spawn(
     })
 }
 
-async fn feed_console(mut stdin: ChildStdin, mut commands: mpsc::Receiver<String>)
+async fn feed_console(
+    mut stdin: ChildStdin,
+    mut commands: mpsc::Receiver<(String, Option<oneshot::Sender<io::Result<()>>>)>,
+)
 {
-    while let Some(line) = commands.recv().await
+    while let Some((line, reply)) = commands.recv().await
     {
         let written = match stdin.write_all(line.as_bytes()).await
         {
             Ok(()) => stdin.flush().await,
             Err(error) => Err(error),
         };
-        if let Err(error) = written
+        let failed = written.is_err();
+        if let Err(error) = &written
         {
             log!("cannot write to the server console: {error}");
+        }
+        if let Some(reply) = reply
+        {
+            let _ = reply.send(written);
+        }
+        if failed
+        {
             return;
         }
     }
@@ -247,6 +270,15 @@ pub fn exit_code(status: ExitStatus) -> i32
 
 async fn read_lines<R: AsyncRead + Unpin>(stream: R, events: mpsc::Sender<Event>)
 {
+    read_lines_source(stream, events, true).await;
+}
+
+async fn read_lines_source<R: AsyncRead + Unpin>(
+    stream: R,
+    events: mpsc::Sender<Event>,
+    stdout: bool,
+)
+{
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     loop
@@ -256,12 +288,29 @@ async fn read_lines<R: AsyncRead + Unpin>(stream: R, events: mpsc::Sender<Event>
             Ok(false) => return,
             Ok(true) =>
             {
-                let text = output::sanitize(&line);
+                let probe_line =
+                    output::single_line(&String::from_utf8_lossy(&line), MAX_RAW_LINE_BYTES);
+                let text = if output::players(&probe_line).is_some()
+                {
+                    probe_line
+                }
+                else
+                {
+                    output::sanitize(&line)
+                };
                 if text.is_empty()
                 {
                     continue;
                 }
-                if events.send(Event::ServerLine(text)).await.is_err()
+                let event = if stdout
+                {
+                    Event::ServerLine(text)
+                }
+                else
+                {
+                    Event::ServerStderr(text)
+                };
+                if events.send(event).await.is_err()
                 {
                     return;
                 }

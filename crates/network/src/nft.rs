@@ -2,8 +2,10 @@ use std::net::Ipv4Addr;
 
 use serde_json::{Value, json};
 
+use crate::PublicIpMode;
 use crate::instance::{AttachMode, InstanceNetworkSpec};
 use crate::names::{InterfaceNames, stable_hash_hex};
+use crate::public::PublicState;
 use crate::subnet::Subnet;
 use crate::wireguard;
 
@@ -19,6 +21,11 @@ pub const NAMESPACE_GUARD_CHAIN: &str = "guest";
 pub const PREROUTING_PRIORITY: i32 = -300;
 pub const FILTER_PRIORITY: i32 = 0;
 pub const SRCNAT_PRIORITY: i32 = 100;
+pub const PUBLIC_FORWARD_CHAIN: &str = "public_forward";
+pub const PUBLIC_DNAT_CHAIN: &str = "public_dnat";
+pub const PUBLIC_SNAT_CHAIN: &str = "public_snat";
+pub const PUBLIC_INGRESS_CHAIN: &str = "public_ingress";
+pub const PUBLIC_INPUT_CHAIN: &str = "public_input";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorldMembership
@@ -116,6 +123,11 @@ pub fn node_ruleset(subnet: Subnet, uplink_ifname: Option<&str>) -> Value
         vec![vmap("iifname", FROM_INSTANCE_MAP)],
     ));
     commands.push(rule(INET, "forward", vec![from_any_instance(), drop()]));
+    commands.push(rule(
+        INET,
+        "forward",
+        vec![json!({"jump": {"target": PUBLIC_FORWARD_CHAIN}})],
+    ));
     commands.push(rule(
         INET,
         "forward",
@@ -442,7 +454,116 @@ fn inet_declarations() -> Vec<Value>
         }));
     }
     commands.push(add_regular_chain(INET, INSTANCE_EGRESS_CHAIN));
+    commands.push(add_regular_chain(INET, PUBLIC_FORWARD_CHAIN));
     commands
+}
+
+pub(crate) fn public_rules(public: &PublicState) -> Value
+{
+    let mut commands = inet_declarations();
+    commands.push(flush_chain(INET, PUBLIC_FORWARD_CHAIN));
+    for (name, kind, hook, priority) in [
+        (PUBLIC_INGRESS_CHAIN, "filter", "prerouting", -150),
+        (PUBLIC_DNAT_CHAIN, "nat", "prerouting", -100),
+        (PUBLIC_SNAT_CHAIN, "nat", "postrouting", SRCNAT_PRIORITY - 1),
+        (PUBLIC_INPUT_CHAIN, "filter", "input", FILTER_PRIORITY - 1),
+    ]
+    {
+        commands.extend(replaced_base_chain(INET, name, kind, hook, priority, None));
+    }
+    for (instance_id, binding) in &public.bindings
+    {
+        let public_ip = json!(binding.address.to_string());
+        let guest_ip = json!(binding.guest_ip.to_string());
+        let destination = compare("==", ip_field("daddr"), public_ip.clone());
+        let original_destination = compare(
+            "==",
+            json!({"ct": {"key": "ip daddr", "dir": "original"}}),
+            public_ip.clone(),
+        );
+        let names = InterfaceNames::for_instance(instance_id);
+        if binding.mode == PublicIpMode::Running
+        {
+            commands.push(rule(
+                INET,
+                PUBLIC_DNAT_CHAIN,
+                vec![
+                    destination,
+                    json!({"dnat": {"family": "ip", "addr": guest_ip}}),
+                ],
+            ));
+            commands.push(rule(
+                INET,
+                PUBLIC_FORWARD_CHAIN,
+                vec![
+                    original_destination,
+                    compare("==", ip_field("daddr"), guest_ip.clone()),
+                    compare("==", meta("oifname"), json!(names.host_veth)),
+                    compare("in", json!({"ct": {"key": "status"}}), json!(["dnat"])),
+                    accept(),
+                ],
+            ));
+        }
+        else
+        {
+            commands.push(rule(
+                INET,
+                PUBLIC_INGRESS_CHAIN,
+                vec![
+                    destination.clone(),
+                    compare("==", payload("tcp", "dport"), json!(25565)),
+                    json!({"return": null}),
+                ],
+            ));
+            commands.push(rule(
+                INET,
+                PUBLIC_INGRESS_CHAIN,
+                vec![destination.clone(), drop()],
+            ));
+            commands.push(rule(
+                INET,
+                PUBLIC_DNAT_CHAIN,
+                vec![
+                    destination,
+                    compare("==", payload("tcp", "dport"), json!(25565)),
+                    json!({"redirect": {"port": binding.responder_port}}),
+                ],
+            ));
+            commands.push(rule(
+                INET,
+                PUBLIC_INPUT_CHAIN,
+                vec![
+                    original_destination,
+                    compare(
+                        "==",
+                        json!({"ct": {"key": "proto-dst", "dir": "original"}}),
+                        json!(25565),
+                    ),
+                    compare("in", json!({"ct": {"key": "status"}}), json!(["dnat"])),
+                    compare("==", payload("tcp", "dport"), json!(binding.responder_port)),
+                    accept(),
+                ],
+            ));
+        }
+        commands.push(rule(
+            INET,
+            PUBLIC_INPUT_CHAIN,
+            vec![
+                compare("==", payload("tcp", "dport"), json!(binding.responder_port)),
+                drop(),
+            ],
+        ));
+        commands.push(rule(
+            INET,
+            PUBLIC_SNAT_CHAIN,
+            vec![
+                compare("==", ip_field("saddr"), guest_ip),
+                compare("==", meta("oifname"), json!(public.config.uplink_interface)),
+                json!({"snat": {"family": "ip", "addr": public_ip}}),
+            ],
+        ));
+    }
+    batch(commands)
 }
 
 fn batch(commands: Vec<Value>) -> Value
@@ -695,6 +816,7 @@ mod tests
                     json!({"vmap": {"key": {"meta": {"key": "iifname"}}, "data": "@from_instance"}})
                 ],
                 vec![from_instance.clone(), json!({"drop": null})],
+                vec![json!({"jump": {"target": PUBLIC_FORWARD_CHAIN}})],
                 vec![
                     to_instance.clone(),
                     established.clone(),

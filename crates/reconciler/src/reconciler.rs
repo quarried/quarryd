@@ -14,7 +14,7 @@ use proto::v1::{
 use sandbox::SandboxRecord;
 use serde_json::{Value, json};
 use store::{InstanceRow, PutOutcome};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
@@ -85,7 +85,10 @@ pub(crate) struct Inner
     pub ipam: Mutex<Option<Ipam>>,
     pub secrets: Mutex<HashMap<String, (u64, SecretValues)>>,
     pub write_lock: Mutex<()>,
+    pub disk_lock: tokio::sync::Mutex<()>,
     pub wake: Notify,
+    pub live_metrics: Mutex<HashMap<String, u64>>,
+    pub health: broadcast::Sender<proto::v1::InstanceHealth>,
     events: Mutex<Option<mpsc::UnboundedSender<ReconcilerEvent>>>,
     pub supervisors: Mutex<BTreeMap<String, SupervisorLink>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -256,7 +259,10 @@ impl Reconciler
             ipam: Mutex::new(None),
             secrets: Mutex::new(HashMap::new()),
             write_lock: Mutex::new(()),
+            disk_lock: tokio::sync::Mutex::new(()),
             wake: Notify::new(),
+            live_metrics: Mutex::new(HashMap::new()),
+            health: broadcast::channel(512).0,
             events: Mutex::new(Some(events)),
             supervisors: Mutex::new(BTreeMap::new()),
             tasks: Mutex::new(Vec::new()),
@@ -300,6 +306,10 @@ impl Reconciler
                         continue;
                     }
                 };
+                for disk in &spec.disks
+                {
+                    inner.parts.store.remember_disk(&row.id, &crate::admission::volume_name(&row.id, &disk.name))?;
+                }
                 let decision = seed_decision(&row, &spec);
                 if let Some(decision) = &decision
                 {
@@ -398,7 +408,7 @@ impl Reconciler
                     Lifecycle::parse_phase(&row.phase),
                     Phase::Pending | Phase::Rejected
                 );
-                let decision = self
+                let mut decision = self
                     .admission
                     .decide(
                         &spec,
@@ -408,6 +418,17 @@ impl Reconciler
                         &self.inner.parts.metrics,
                     )
                     .await;
+                if let Some(network) = &spec.network
+                    && !network.public_ipv4.is_empty()
+                    && let Err(error) = self
+                        .inner
+                        .parts
+                        .network
+                        .validate_public_ipv4(&spec.id, &network.public_ipv4)
+                {
+                    decision.verdict = Verdict::Rejected(error.to_string());
+                    self.admission.seed(&spec.id, decision.clone());
+                }
                 if let Verdict::Rejected(reason) = &decision.verdict
                 {
                     tracing::debug!(instance_id = %row.id, generation = decision.generation, reason = %reason, "admission rejected");
@@ -477,7 +498,71 @@ impl ReconcilerHandle
         let secrets = strip_secrets(&mut spec);
         let bytes = spec.encode_to_vec();
         let outcome = {
+            let _disk_guard = self.inner.disk_lock.lock().await;
             let _guard = lock(&self.inner.write_lock);
+            if let Some(current) = self.inner.parts.store.get_instance(&spec.id)?
+                && current.generation > spec.generation
+            {
+                return Ok(());
+            }
+            if let Some(network) = &spec.network
+                && !network.public_ipv4.is_empty()
+            {
+                let mut rejection = self
+                    .inner
+                    .parts
+                    .network
+                    .validate_public_ipv4(&spec.id, &network.public_ipv4)
+                    .err()
+                    .map(|error| error.to_string());
+                if rejection.is_none()
+                {
+                    for row in self.inner.parts.store.list_instances()?
+                    {
+                        if row.id == spec.id
+                            || row.desired_deleted
+                            || Lifecycle::parse_phase(&row.phase) == Phase::Rejected
+                        {
+                            continue;
+                        }
+                        let other = decode_spec(&row.spec)?;
+                        if other
+                            .network
+                            .as_ref()
+                            .is_some_and(|other| other.public_ipv4 == network.public_ipv4)
+                        {
+                            rejection = Some(format!(
+                                "public IPv4 {} is already reserved by instance {}",
+                                network.public_ipv4, row.id
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if let Some(reason) = rejection
+                {
+                    self.inner.emit(InstanceStatus {
+                        id: spec.id.clone(),
+                        observed_generation: spec.generation,
+                        phase: Phase::Rejected as i32,
+                        reason,
+                        ..Default::default()
+                    });
+                    return Ok(());
+                }
+            }
+            if let Some(previous) = self.inner.parts.store.get_instance(&spec.id)?
+                && previous.generation < spec.generation
+            {
+                let previous_spec = decode_spec(&previous.spec)?;
+                for disk in &previous_spec.disks
+                {
+                    self.inner.parts.store.remember_disk(
+                        &spec.id,
+                        &crate::admission::volume_name(&spec.id, &disk.name),
+                    )?;
+                }
+            }
             self.inner
                 .parts
                 .store
@@ -720,6 +805,18 @@ impl ReconcilerHandle
         destination_prefix: &str,
     ) -> Result<String, ReconcilerError>
     {
+        Ok(self
+            .snapshot_details(instance_id, destination_prefix)
+            .await?
+            .0)
+    }
+
+    pub async fn snapshot_details(
+        &self,
+        instance_id: &str,
+        destination_prefix: &str,
+    ) -> Result<(String, u64, String), ReconcilerError>
+    {
         let span = self.inner.node_span.clone();
         async {
             tracing::info!(instance_id = %instance_id, prefix = %destination_prefix, "snapshot requested");
@@ -757,7 +854,7 @@ impl ReconcilerHandle
                 bytes = manifest.total_size,
                 "snapshot uploaded"
             );
-            Ok(key)
+            Ok((key, manifest.total_size, taken.disk))
         }
         .instrument(span)
         .await
@@ -767,12 +864,29 @@ impl ReconcilerHandle
         &self,
         instance_id: &str,
         command: &str,
-    ) -> Result<(), ReconcilerError>
+    ) -> Result<Vec<String>, ReconcilerError>
+    {
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let request_id = format!(
+            "{}-{}",
+            unix_ms_now(),
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        );
+        self.console_output(instance_id, &request_id, command).await
+    }
+
+    pub async fn console_output(
+        &self,
+        instance_id: &str,
+        request_id: &str,
+        command: &str,
+    ) -> Result<Vec<String>, ReconcilerError>
     {
         let message = guest_proto::HostMessage {
             body: Some(guest_proto::HostBody::ConsoleCommand(
                 guest_proto::ConsoleCommand {
                     command: command.to_owned(),
+                    request_id: request_id.to_owned(),
                 },
             )),
         };
@@ -781,7 +895,30 @@ impl ReconcilerHandle
         let (reply, receiver) = oneshot::channel();
         self.command(instance_id, Command::Console { message, reply })
             .await?;
-        self.reply("console command", receiver).await
+        self.reply("console output", receiver).await
+    }
+
+    pub fn set_live_metrics(&self, live: proto::v1::LiveMetrics)
+    {
+        let mut subscriptions = lock(&self.inner.live_metrics);
+        if live.until_unix_ms <= u64::try_from(unix_ms_now()).unwrap_or(0)
+        {
+            subscriptions.remove(&live.instance_id);
+        }
+        else
+        {
+            subscriptions.insert(live.instance_id, live.until_unix_ms);
+        }
+    }
+
+    pub fn subscribe_health(&self) -> broadcast::Receiver<proto::v1::InstanceHealth>
+    {
+        self.inner.health.subscribe()
+    }
+
+    pub fn subscribe_wakes(&self) -> broadcast::Receiver<network::PublicWake>
+    {
+        self.inner.parts.network.subscribe_wakes()
     }
 
     pub fn set_draining(&self, draining: bool)

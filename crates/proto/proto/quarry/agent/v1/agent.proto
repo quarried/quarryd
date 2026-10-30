@@ -40,6 +40,10 @@ message AgentMessage
         OperationResult op_result = 14;
         // Lease renewal request for held leases.
         LeaseRenewal lease = 15;
+        // Unnumbered display and host resource sample; never replayed.
+        InstanceHealth health = 16;
+        // Unnumbered request from a sleeping instance login.
+        WakeRequest wake = 17;
     }
 }
 
@@ -68,6 +72,8 @@ message ControlMessage
         AgentUpdate update = 15;
         // Full desired state for the node, replacing any previous one.
         DesiredState desired = 16;
+        // Temporarily increase health reporting frequency.
+        LiveMetrics live = 17;
     }
 }
 
@@ -157,6 +163,10 @@ message Capabilities
     string arch = 3;
     // WireGuard public key of this node for the regional mesh.
     string wireguard_public_key = 4;
+    // Public IPv4 addresses or CIDRs routed to this host.
+    repeated string public_ipv4_pool = 5;
+    // Provider-facing interface.
+    string uplink_interface = 6;
 }
 
 // One instance known to the agent.
@@ -353,6 +363,8 @@ message InstanceNetwork
     uint32 egress_mbit = 2;
     // Ports the edge proxy forwards to the instance.
     repeated uint32 ports = 3;
+    // Dedicated public IPv4 for all ports; empty retains private networking.
+    string public_ipv4 = 4;
 }
 
 // Lease attached to an instance spec.
@@ -578,4 +590,44 @@ message EnrollResponse
     string ca_pem = 2;
     // Certificate expiry in Unix seconds.
     uint64 expires_at_unix = 3;
+}
+
+// Online player reported by the untrusted guest; display only.
+message PlayerInfo
+{
+    string uuid = 1;
+    string name = 2;
+    uint64 online_since_unix_ms = 3;
+    bool operator = 4;
+}
+
+// Guest health with host-measured resource counters, sent with seq zero.
+message InstanceHealth
+{
+    string instance_id = 1;
+    uint64 sampled_at_unix_ms = 2;
+    double tps = 3;
+    double mspt_p50_ms = 4;
+    double mspt_p99_ms = 5;
+    uint32 players = 6;
+    repeated PlayerInfo player_list = 7;
+    uint64 cpu_usec_total = 8;
+    uint64 memory_bytes = 9;
+    uint64 net_tx_bytes_total = 10;
+    uint64 net_rx_bytes_total = 11;
+    uint64 disk_used_bytes = 12;
+}
+
+// Health subscription expiry in Unix milliseconds; zero cancels.
+message LiveMetrics
+{
+    string instance_id = 1;
+    uint64 until_unix_ms = 2;
+}
+
+// Login attempt on a sleeping instance, sent with seq zero.
+message WakeRequest
+{
+    string instance_id = 1;
+    uint64 requested_at_unix_ms = 2;
 }

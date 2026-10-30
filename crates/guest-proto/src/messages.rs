@@ -6,7 +6,7 @@ use std::fmt;
 pub struct GuestMessage
 {
     /// Payload; a message without one is rejected.
-    #[prost(oneof = "GuestBody", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "GuestBody", tags = "1, 2, 3, 4, 5, 6")]
     pub body: Option<GuestBody>,
 }
 
@@ -29,6 +29,9 @@ pub enum GuestBody
     /// Answer to [`PrepareSnapshot`]: the world is flushed and writes are frozen.
     #[prost(message, tag = "5")]
     SnapshotPrepared(SnapshotPrepared),
+    /// Bounded output captured for a host console request.
+    #[prost(message, tag = "6")]
+    ConsoleOutput(ConsoleOutput),
 }
 
 /// The server has started and accepts players.
@@ -56,6 +59,15 @@ pub struct Health
     /// JVM heap in use, at most 1 TiB.
     #[prost(uint64, tag = "4")]
     pub heap_used_bytes: u64,
+    /// Online players, at most 500 and bounded by the guest frame limit.
+    #[prost(message, repeated, tag = "5")]
+    pub player_list: Vec<PlayerInfo>,
+    /// Median tick duration in milliseconds.
+    #[prost(double, tag = "6")]
+    pub mspt_p50_ms: f64,
+    /// 99th percentile tick duration in milliseconds.
+    #[prost(double, tag = "7")]
+    pub mspt_p99_ms: f64,
 }
 
 /// One line of server output.
@@ -167,6 +179,9 @@ pub struct ConsoleCommand
     /// The command, at most 1024 bytes, without line terminators.
     #[prost(string, tag = "1")]
     pub command: String,
+    /// Correlates the output response; empty for internal probes.
+    #[prost(string, tag = "2")]
+    pub request_id: String,
 }
 
 /// Flush the world and freeze writes; answered with [`SnapshotPrepared`].
@@ -184,4 +199,34 @@ pub struct Shutdown
     /// Time the server has to exit, in milliseconds.
     #[prost(uint64, tag = "1")]
     pub deadline_ms: u64,
+}
+
+/// Player identity reported by the server.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct PlayerInfo
+{
+    /// Canonical UUID text.
+    #[prost(string, tag = "1")]
+    pub uuid: String,
+    /// Minecraft name, at most 16 ASCII letters, digits or underscores.
+    #[prost(string, tag = "2")]
+    pub name: String,
+    /// Login timestamp in Unix milliseconds.
+    #[prost(uint64, tag = "3")]
+    pub online_since_unix_ms: u64,
+    /// Whether the player is an operator.
+    #[prost(bool, tag = "4")]
+    pub operator: bool,
+}
+
+/// Console output collected for at most 500 milliseconds, within one guest frame.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct ConsoleOutput
+{
+    /// Host request identity, at most 128 bytes.
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+    /// At most 64 lines of at most 4096 bytes each, also limited by frame size.
+    #[prost(string, repeated, tag = "2")]
+    pub lines: Vec<String>,
 }

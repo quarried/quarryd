@@ -7,7 +7,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, param
 #[cfg(test)]
 mod tests;
 
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE instances (
         id TEXT PRIMARY KEY NOT NULL,
         generation INTEGER NOT NULL,
@@ -84,7 +85,15 @@ const MIGRATIONS: &[&str] = &["
         key TEXT PRIMARY KEY NOT NULL,
         value BLOB NOT NULL
     ) WITHOUT ROWID;
-    "];
+    ",
+    "
+    CREATE TABLE instance_disks (
+        instance_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        PRIMARY KEY (instance_id, name)
+    ) WITHOUT ROWID;
+    ",
+];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
@@ -423,6 +432,34 @@ impl Store
         };
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    pub fn remember_disk(&self, instance_id: &str, name: &str) -> Result<(), StoreError>
+    {
+        self.connection().execute(
+            "INSERT OR IGNORE INTO instance_disks (instance_id, name) VALUES (?1, ?2)",
+            params![instance_id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn instance_disks(&self, instance_id: &str) -> Result<Vec<String>, StoreError>
+    {
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare("SELECT name FROM instance_disks WHERE instance_id = ?1 ORDER BY name")?;
+        Ok(statement
+            .query_map([instance_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn forget_disk(&self, instance_id: &str, name: &str) -> Result<(), StoreError>
+    {
+        self.connection().execute(
+            "DELETE FROM instance_disks WHERE instance_id = ?1 AND name = ?2",
+            params![instance_id, name],
+        )?;
+        Ok(())
     }
 
     pub fn mark_deleted_desired(&self, id: &str) -> Result<bool, StoreError>

@@ -748,6 +748,7 @@ dependencies = [
  "guest-proto",
  "nix 0.31.3",
  "prost",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-vsock",

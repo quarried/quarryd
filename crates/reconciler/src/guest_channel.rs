@@ -495,6 +495,7 @@ mod tests
                     mspt: 0.0,
                     players: 0,
                     heap_used_bytes: 0,
+                    ..Default::default()
                 })),
             },
         )

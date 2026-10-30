@@ -63,6 +63,7 @@ fn spec() -> InstanceSpec
             world_id: "world-9".to_owned(),
             egress_mbit: 100,
             ports: vec![25565],
+            public_ipv4: String::new(),
         }),
         env: HashMap::from([
             ("EULA".to_owned(), "true".to_owned()),

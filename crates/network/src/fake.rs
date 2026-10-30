@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -8,12 +9,22 @@ use serde::{Deserialize, Serialize};
 use crate::error::NetworkError;
 use crate::instance::{InstanceNetworkSpec, InterfaceCounters, NetworkAttachment};
 use crate::node::NodeNetwork;
-use crate::{Network, ensure_subnet_change_allowed, state_file};
+use crate::public::{ProxyNeighbour, PublicState};
+use crate::responder::SleepResponder;
+use crate::{
+    Network, PublicIpMetrics, PublicIpMode, PublicIpv4Config, PublicWake,
+    ensure_subnet_change_allowed, nft, state_file,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FakeOperation
 {
     ConfigureNode,
+    ConfigurePublic,
+    AttachPublic,
+    DetachPublic,
+    SetPublicMode,
+    ApplyPublic,
     Attach,
     Detach,
     Counters,
@@ -24,6 +35,10 @@ pub enum FakeOperation
 pub enum FakeCall
 {
     ConfigureNode(NodeNetwork),
+    ConfigurePublic(PublicIpv4Config),
+    AttachPublic(String, Ipv4Addr),
+    DetachPublic(String),
+    SetPublicMode(String, PublicIpMode),
     Attach(InstanceNetworkSpec),
     Detach(String),
     Counters(String),
@@ -35,6 +50,10 @@ struct PersistedFake
 {
     node: Option<NodeNetwork>,
     attachments: BTreeMap<String, NetworkAttachment>,
+    #[serde(default)]
+    specs: BTreeMap<String, InstanceNetworkSpec>,
+    #[serde(default)]
+    public: PublicState,
 }
 
 #[derive(Debug)]
@@ -45,6 +64,9 @@ struct FakeState
     calls: Vec<FakeCall>,
     pending_failures: Vec<(FakeOperation, String)>,
     wireguard_public_key: Option<String>,
+    nft_transactions: Vec<serde_json::Value>,
+    proxies: std::collections::BTreeSet<ProxyNeighbour>,
+    applied_public: Option<PublicState>,
 }
 
 #[derive(Debug)]
@@ -52,6 +74,7 @@ pub struct FakeNetwork
 {
     path: Option<PathBuf>,
     state: Mutex<FakeState>,
+    responder: SleepResponder,
 }
 
 impl FakeNetwork
@@ -66,7 +89,7 @@ impl FakeNetwork
             Some(path) => state_file::load(path)?.unwrap_or_default(),
             None => PersistedFake::default(),
         };
-        Ok(FakeNetwork {
+        let fake = FakeNetwork {
             path,
             state: Mutex::new(FakeState {
                 persisted,
@@ -74,8 +97,31 @@ impl FakeNetwork
                 calls: Vec::new(),
                 pending_failures: Vec::new(),
                 wireguard_public_key: Some(Self::DEFAULT_WIREGUARD_PUBLIC_KEY.to_string()),
+                nft_transactions: Vec::new(),
+                proxies: Default::default(),
+                applied_public: None,
             }),
-        })
+            responder: SleepResponder::new(Ipv4Addr::LOCALHOST),
+        };
+        {
+            let mut state = fake.lock();
+            if let Some(node) = state.persisted.node.clone()
+            {
+                state
+                    .nft_transactions
+                    .push(nft::node_ruleset(node.subnet, None));
+            }
+            let specs: Vec<_> = state.persisted.specs.values().cloned().collect();
+            for spec in specs
+            {
+                state.nft_transactions.push(nft::instance_rules(&spec));
+            }
+            if state.persisted.node.is_some() || state.persisted.public != PublicState::default()
+            {
+                fake.apply_public(&mut state)?;
+            }
+        }
+        Ok(fake)
     }
 
     pub fn set_counters(&self, instance_id: &str, counters: InterfaceCounters)
@@ -98,6 +144,46 @@ impl FakeNetwork
     pub fn calls(&self) -> Vec<FakeCall>
     {
         self.lock().calls.clone()
+    }
+
+    pub fn responder_address(&self, instance_id: &str) -> Option<SocketAddr>
+    {
+        self.responder.address(instance_id)
+    }
+
+    pub fn public_bindings(&self) -> BTreeMap<String, Ipv4Addr>
+    {
+        self.lock()
+            .persisted
+            .public
+            .bindings
+            .iter()
+            .map(|(id, binding)| (id.clone(), binding.address))
+            .collect()
+    }
+
+    pub fn public_mode(&self, instance_id: &str) -> Option<PublicIpMode>
+    {
+        self.lock()
+            .persisted
+            .public
+            .bindings
+            .get(instance_id)
+            .map(|binding| binding.mode)
+    }
+
+    pub fn nft_transactions(&self) -> Vec<serde_json::Value>
+    {
+        self.lock().nft_transactions.clone()
+    }
+
+    pub fn proxy_neighbours(&self) -> Vec<(String, Ipv4Addr)>
+    {
+        self.lock()
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.interface.clone(), proxy.address))
+            .collect()
     }
 
     pub fn fail_next(&self, operation: FakeOperation, message: impl Into<String>)
@@ -144,6 +230,33 @@ impl FakeNetwork
             None => Ok(()),
         }
     }
+
+    fn apply_public(&self, state: &mut FakeState) -> Result<(), NetworkError>
+    {
+        self.responder.prepare(&mut state.persisted.public)?;
+        if state.applied_public.as_ref() == Some(&state.persisted.public)
+        {
+            return Ok(());
+        }
+        self.persist(state)?;
+        if let Some(index) = state
+            .pending_failures
+            .iter()
+            .position(|(operation, _)| *operation == FakeOperation::ApplyPublic)
+        {
+            let (_, message) = state.pending_failures.remove(index);
+            return Err(NetworkError::Injected(message));
+        }
+        state
+            .nft_transactions
+            .push(nft::public_rules(&state.persisted.public));
+        state.proxies = state.persisted.public.proxies();
+        state.persisted.public.retired_proxies.clear();
+        self.persist(state)?;
+        self.responder.publish(&state.persisted.public);
+        state.applied_public = Some(state.persisted.public.clone());
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -162,7 +275,85 @@ impl Network for FakeNetwork
             node,
         )?;
         state.persisted.node = Some(node.clone());
-        self.persist(&state)
+        self.persist(&state)?;
+        let uplink = (!state.persisted.public.config.uplink_interface.is_empty())
+            .then_some(state.persisted.public.config.uplink_interface.as_str());
+        let rules = nft::node_ruleset(node.subnet, uplink);
+        state.nft_transactions.push(rules);
+        Ok(())
+    }
+
+    async fn configure_public(&self, config: &PublicIpv4Config) -> Result<(), NetworkError>
+    {
+        let mut state = self.begin(
+            FakeCall::ConfigurePublic(config.clone()),
+            FakeOperation::ConfigurePublic,
+        )?;
+        state.persisted.public.configure(config)?;
+        self.apply_public(&mut state)
+    }
+
+    fn validate_public_ipv4(&self, instance_id: &str, address: &str) -> Result<(), NetworkError>
+    {
+        self.lock().persisted.public.validate(instance_id, address)
+    }
+
+    async fn attach_public(&self, instance_id: &str, address: Ipv4Addr)
+    -> Result<(), NetworkError>
+    {
+        let mut state = self.begin(
+            FakeCall::AttachPublic(instance_id.to_string(), address),
+            FakeOperation::AttachPublic,
+        )?;
+        let guest_ip = state
+            .persisted
+            .attachments
+            .get(instance_id)
+            .ok_or_else(|| NetworkError::NotAttached(instance_id.to_string()))?
+            .guest_ip;
+        state
+            .persisted
+            .public
+            .attach(instance_id, address, guest_ip)?;
+        self.apply_public(&mut state)
+    }
+
+    async fn detach_public(&self, instance_id: &str) -> Result<(), NetworkError>
+    {
+        let mut state = self.begin(
+            FakeCall::DetachPublic(instance_id.to_string()),
+            FakeOperation::DetachPublic,
+        )?;
+        state.persisted.public.remove(instance_id);
+        self.apply_public(&mut state)
+    }
+
+    async fn set_public_mode(
+        &self,
+        instance_id: &str,
+        mode: PublicIpMode,
+    ) -> Result<(), NetworkError>
+    {
+        let mut state = self.begin(
+            FakeCall::SetPublicMode(instance_id.to_string(), mode),
+            FakeOperation::SetPublicMode,
+        )?;
+        if let Some(binding) = state.persisted.public.bindings.get_mut(instance_id)
+        {
+            binding.mode = mode;
+            self.apply_public(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn subscribe_wakes(&self) -> tokio::sync::broadcast::Receiver<PublicWake>
+    {
+        self.responder.subscribe()
+    }
+
+    fn public_metrics(&self) -> PublicIpMetrics
+    {
+        self.responder.metrics()
     }
 
     async fn attach(&self, spec: &InstanceNetworkSpec) -> Result<NetworkAttachment, NetworkError>
@@ -183,6 +374,11 @@ impl Network for FakeNetwork
                 .map(|attachment| (attachment.instance_id.as_str(), attachment.guest_ip)),
         )?;
         let attachment = spec.attachment(subnet);
+        let changed = state.persisted.specs.get(&spec.instance_id) != Some(spec);
+        state
+            .persisted
+            .specs
+            .insert(spec.instance_id.clone(), spec.clone());
         if state.persisted.attachments.get(&spec.instance_id) != Some(&attachment)
         {
             state
@@ -190,6 +386,16 @@ impl Network for FakeNetwork
                 .attachments
                 .insert(spec.instance_id.clone(), attachment.clone());
             self.persist(&state)?;
+        }
+        if changed
+        {
+            self.persist(&state)?;
+            state.nft_transactions.push(nft::instance_rules(spec));
+            if let Some(binding) = state.persisted.public.bindings.get_mut(&spec.instance_id)
+            {
+                binding.guest_ip = spec.guest_ip;
+                self.apply_public(&mut state)?;
+            }
         }
         Ok(attachment)
     }
@@ -200,7 +406,10 @@ impl Network for FakeNetwork
             FakeCall::Detach(instance_id.to_string()),
             FakeOperation::Detach,
         )?;
+        state.persisted.public.remove(instance_id);
+        self.apply_public(&mut state)?;
         state.counters.remove(instance_id);
+        state.persisted.specs.remove(instance_id);
         if state.persisted.attachments.remove(instance_id).is_some()
         {
             self.persist(&state)?;

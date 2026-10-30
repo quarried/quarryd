@@ -284,3 +284,60 @@ async fn replayed_puts_and_repeated_passes_have_no_side_effects()
     node.wait_gone(id, &fixture.store).await;
     node.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_cleanup_survives_a_crash_after_the_new_disk_is_running()
+{
+    let fixture = Fixture::new().await;
+    let node = fixture.start().await;
+    node.configure().await;
+    let snapshot_path = fixture.path("replacement-snapshot.img");
+    std::fs::write(&snapshot_path, b"snapshot world contents").unwrap();
+    let snapshots = SnapshotStore::new(fixture.snapshot_objects.clone(), 1024, 2);
+    snapshots
+        .upload(&snapshot_path, "replacement", "old-world", 1)
+        .await
+        .unwrap();
+    let id = "disk-replace-crash";
+    let mut spec = fixture.spec(id, "normal");
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    node.wait_running(id, 1).await;
+    crash::arm(id, "PHASE_RUNNING");
+    spec.generation = 2;
+    spec.disks[0].name = "restored".to_owned();
+    spec.disks[0].restore_from = Some(proto::v1::SnapshotRef {
+        manifest_key: SnapshotStore::manifest_key("replacement"),
+    });
+    node.handle.put_instance(spec.clone()).await.unwrap();
+    wait_for_crash(id, "PHASE_RUNNING").await;
+    assert_eq!(
+        fixture.store.instance_disks(id).unwrap(),
+        vec![format!("{id}-data"), format!("{id}-restored")]
+    );
+    assert_eq!(fixture.volume_files().len(), 2);
+    node.stop().await;
+    let node = fixture.start().await;
+    node.wait_running(id, 2).await;
+    let until = tokio::time::Instant::now() + WAIT;
+    while fixture.volume_files().len() != 1
+    {
+        assert!(tokio::time::Instant::now() < until);
+        sleep_ms(10).await;
+    }
+    assert_eq!(fixture.volume_files(), vec![format!("{id}-restored.img")]);
+    let restored = fixture.path(&format!("volumes/{id}-restored.img"));
+    assert_eq!(
+        std::fs::read(&restored).unwrap(),
+        b"snapshot world contents"
+    );
+    std::fs::write(&restored, b"new live world changes").unwrap();
+    spec.generation = 3;
+    node.handle.put_instance(spec).await.unwrap();
+    node.wait_running(id, 3).await;
+    assert_eq!(std::fs::read(&restored).unwrap(), b"new live world changes");
+    assert_eq!(fixture.volume_files(), vec![format!("{id}-restored.img")]);
+    node.handle.delete_instance(id).await.unwrap();
+    node.wait_gone(id, &fixture.store).await;
+    assert!(fixture.store.instance_disks(id).unwrap().is_empty());
+    node.stop().await;
+}

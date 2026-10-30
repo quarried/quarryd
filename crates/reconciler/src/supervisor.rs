@@ -86,6 +86,7 @@ pub(crate) struct TakenSnapshot
 {
     pub snapshot: VolumeInfo,
     pub volume: String,
+    pub disk: String,
     pub lease_epoch: u64,
 }
 
@@ -98,7 +99,7 @@ pub(crate) enum Command
     Console
     {
         message: HostMessage,
-        reply: oneshot::Sender<Result<(), ReconcilerError>>,
+        reply: oneshot::Sender<Result<Vec<String>, ReconcilerError>>,
     },
 }
 
@@ -173,6 +174,7 @@ pub(crate) struct Supervisor
     health_reports: u64,
     shutdown_complete: bool,
     snapshot_prepared: Option<SnapshotPrepared>,
+    console_output: Option<guest_proto::ConsoleOutput>,
     phase_started: Instant,
     connect_deadline: Option<Instant>,
     ready_deadline: Option<Instant>,
@@ -244,6 +246,7 @@ impl Supervisor
             health_reports: 0,
             shutdown_complete: false,
             snapshot_prepared: None,
+            console_output: None,
             phase_started: now,
             connect_deadline: None,
             ready_deadline: None,
@@ -479,6 +482,7 @@ impl Supervisor
                 return Ok(());
             }
             let desired = self.desired.borrow_and_update().clone();
+            self.sync_public_mode(&desired.spec).await?;
             let progressed = match self.phase
             {
                 Phase::Pending | Phase::Unspecified => self.step_pending(&desired).await?,
@@ -575,6 +579,15 @@ impl Supervisor
         if !desired.admitted()
         {
             return Ok(false);
+        }
+        if !desired.run_requested() && lock(&self.inner.ipam).is_some()
+        {
+            self.prepared = Some(self.prepare(&desired.spec).await?);
+            self.observed_generation = desired.spec.generation;
+            self.running_spec = Some(Arc::clone(&desired.spec));
+            self.transition(Phase::Stopped, RUN_STATE_STOPPED.to_owned())
+                .await?;
+            return Ok(true);
         }
         if let Some(blocker) = self.blocker(desired)
         {
@@ -779,6 +792,8 @@ impl Supervisor
             self.graceful_stop(reason).await?;
             return Ok(true);
         }
+        self.checkpoint("before-disk-cleanup").await;
+        self.cleanup_replaced_disks().await?;
         self.check_health()?;
         self.reclaim_idle_memory().await;
         Ok(false)
@@ -813,8 +828,11 @@ impl Supervisor
             && !desired.run_requested()
             && self.observed_generation != desired.spec.generation
         {
+            self.prepared = Some(self.prepare(&desired.spec).await?);
             self.observed_generation = desired.spec.generation;
+            self.running_spec = Some(Arc::clone(&desired.spec));
             self.commit()?;
+            self.sync_public_mode(&desired.spec).await?;
         }
         if desired.admitted()
             && let Some(blocker) = self.blocker(desired)
@@ -1503,6 +1521,10 @@ impl Supervisor
             {
                 self.snapshot_prepared = Some(prepared);
             }
+            GuestBody::ConsoleOutput(output) =>
+            {
+                self.console_output = Some(output);
+            }
             GuestBody::Log(_) =>
             {}
         }
@@ -1520,25 +1542,80 @@ impl Supervisor
             }
             Command::Console { message, reply } =>
             {
-                let result = match (self.phase, self.guest.as_ref())
-                {
-                    (Phase::Running, Some(guest)) => guest.send(&message).await,
-                    (Phase::Running, None) =>
-                    {
-                        Err(ReconcilerError::GuestNotConnected(self.id.clone()))
-                    }
-                    (phase, _) => Err(ReconcilerError::NotRunning {
-                        id: self.id.clone(),
-                        phase,
-                    }),
-                };
-                if result.is_ok()
-                {
-                    tracing::info!("console command sent");
-                }
+                let result = self.capture_console(message).await;
                 let _ = reply.send(result);
             }
         }
+    }
+
+    async fn capture_console(
+        &mut self,
+        message: HostMessage,
+    ) -> Result<Vec<String>, ReconcilerError>
+    {
+        if self.phase != Phase::Running
+        {
+            return Err(ReconcilerError::NotRunning {
+                id: self.id.clone(),
+                phase: self.phase,
+            });
+        }
+        let request_id = match &message.body
+        {
+            Some(HostBody::ConsoleCommand(command)) => command.request_id.clone(),
+            _ =>
+            {
+                return Err(ReconcilerError::InvalidCommand(
+                    "missing console request".to_owned(),
+                ));
+            }
+        };
+        self.console_output = None;
+        self.guest
+            .as_ref()
+            .ok_or_else(|| ReconcilerError::GuestNotConnected(self.id.clone()))?
+            .send(&message)
+            .await?;
+        let until = Instant::now() + Duration::from_secs(3);
+        loop
+        {
+            if let Some(output) = self.console_output.take()
+                && output.request_id == request_id
+            {
+                return Ok(output.lines);
+            }
+            tokio::select! {
+                event = next_guest_event(&mut self.guest) => self.on_guest_event(event).await?,
+                _ = sleep_until(until) => return Err(ReconcilerError::Timeout("waiting for console output".to_owned())),
+            }
+        }
+    }
+
+    async fn sync_public_mode(&self, spec: &InstanceSpec) -> Result<(), ReconcilerError>
+    {
+        if self.attachment.is_none()
+        {
+            return Ok(());
+        }
+        let mode = match self.phase
+        {
+            Phase::Running => network::PublicIpMode::Running,
+            Phase::Preparing | Phase::Booting | Phase::Starting => network::PublicIpMode::Starting,
+            _ if spec
+                .env
+                .get("QUARRY_HIBERNATED")
+                .is_some_and(|value| value == "true") =>
+            {
+                network::PublicIpMode::Hibernated
+            }
+            _ => network::PublicIpMode::Stopped,
+        };
+        self.inner
+            .parts
+            .network
+            .set_public_mode(&self.id, mode)
+            .await?;
+        Ok(())
     }
 
     async fn take_snapshot(&mut self) -> Result<TakenSnapshot, ReconcilerError>
@@ -1594,6 +1671,7 @@ impl Supervisor
         Ok(TakenSnapshot {
             snapshot,
             volume,
+            disk: disk.name.clone(),
             lease_epoch: lock(&self.inner.leases).epoch(&self.id),
         })
     }
@@ -1648,6 +1726,8 @@ impl Supervisor
         tracing::info!(from = %from, to = %to, reason = %self.reason, generation = self.observed_generation, "phase transition");
         self.commit()?;
         self.inner.wake.notify_one();
+        let desired = self.desired.borrow().spec.clone();
+        self.sync_public_mode(&desired).await?;
         self.checkpoint(Lifecycle::phase_name(to)).await;
         Ok(())
     }

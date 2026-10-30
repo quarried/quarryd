@@ -80,6 +80,13 @@ pub enum GuestProtoError
 /// Decodes and schema-validates a message received from the untrusted guest.
 pub fn decode_guest_message(bytes: &[u8]) -> Result<GuestMessage, GuestProtoError>
 {
+    if bytes.len() > crate::MAX_FRAME_BYTES
+    {
+        return Err(GuestProtoError::TooLong {
+            field: "frame",
+            max: crate::MAX_FRAME_BYTES,
+        });
+    }
     let message = GuestMessage::decode(bytes)?;
     match &message.body
     {
@@ -91,6 +98,24 @@ pub fn decode_guest_message(bytes: &[u8]) -> Result<GuestMessage, GuestProtoErro
         )?,
         Some(GuestBody::Health(health)) => validate_health(health)?,
         Some(GuestBody::Log(log)) => single_line("line", &log.line, MAX_LOG_LINE_BYTES)?,
+        Some(GuestBody::ConsoleOutput(output)) =>
+        {
+            if output.request_id.is_empty()
+            {
+                return Err(GuestProtoError::Invalid {
+                    field: "request_id",
+                });
+            }
+            single_line("request_id", &output.request_id, MAX_INSTANCE_ID_BYTES)?;
+            if output.lines.len() > 64
+            {
+                return Err(GuestProtoError::OutOfRange { field: "lines" });
+            }
+            for line in &output.lines
+            {
+                single_line("line", line, MAX_LOG_LINE_BYTES)?;
+            }
+        }
         Some(GuestBody::ShutdownComplete(_)) =>
         {}
         Some(GuestBody::SnapshotPrepared(prepared)) =>
@@ -111,7 +136,18 @@ pub fn decode_host_message(bytes: &[u8]) -> Result<HostMessage, GuestProtoError>
         Some(HostBody::Configure(configure)) => validate_configure(configure)?,
         Some(HostBody::ConsoleCommand(console)) =>
         {
-            single_line("command", &console.command, MAX_CONSOLE_COMMAND_BYTES)?
+            single_line("request_id", &console.request_id, MAX_INSTANCE_ID_BYTES)?;
+            single_line("command", &console.command, MAX_CONSOLE_COMMAND_BYTES)?;
+            if console.request_id.is_empty()
+                && !matches!(
+                    console.command.as_str(),
+                    "list" | "list uuids" | "tps" | "mspt"
+                )
+            {
+                return Err(GuestProtoError::Invalid {
+                    field: "request_id",
+                });
+            }
         }
         Some(HostBody::PrepareSnapshot(_)) | Some(HostBody::ResumeWrites(_)) =>
         {}
@@ -132,6 +168,44 @@ fn validate_health(health: &Health) -> Result<(), GuestProtoError>
 {
     in_range("tps", health.tps, MAX_TPS)?;
     in_range("mspt", health.mspt, MAX_MSPT)?;
+    in_range("mspt_p50_ms", health.mspt_p50_ms, MAX_MSPT)?;
+    in_range("mspt_p99_ms", health.mspt_p99_ms, MAX_MSPT)?;
+    if health.player_list.len() > 500
+    {
+        return Err(GuestProtoError::OutOfRange {
+            field: "player_list",
+        });
+    }
+    for player in &health.player_list
+    {
+        if player.name.is_empty()
+            || player.name.len() > 16
+            || !player
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return Err(GuestProtoError::Invalid {
+                field: "player_name",
+            });
+        }
+        if player.uuid.len() != 36
+            || !player.uuid.bytes().enumerate().all(|(i, c)| {
+                if [8, 13, 18, 23].contains(&i)
+                {
+                    c == b'-'
+                }
+                else
+                {
+                    c.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err(GuestProtoError::Invalid {
+                field: "player_uuid",
+            });
+        }
+    }
     if health.players > MAX_PLAYERS
     {
         return Err(GuestProtoError::OutOfRange { field: "players" });
@@ -261,6 +335,7 @@ mod tests
             mspt,
             players,
             heap_used_bytes,
+            ..Default::default()
         }))
     }
 
@@ -292,6 +367,7 @@ mod tests
                 mspt: 12.5,
                 players: 7,
                 heap_used_bytes: 2 << 30,
+                ..Default::default()
             }),
             GuestBody::Log(Log {
                 line: "[Server] Done (3.2s)!\tok".to_owned(),
@@ -316,6 +392,7 @@ mod tests
             HostBody::Configure(configure()),
             HostBody::ConsoleCommand(ConsoleCommand {
                 command: "say hi".to_owned(),
+                request_id: "test-command".to_owned(),
             }),
             HostBody::PrepareSnapshot(PrepareSnapshot {}),
             HostBody::ResumeWrites(ResumeWrites {}),
@@ -327,6 +404,116 @@ mod tests
         {
             let decoded = decode_host_message(&host(body.clone())).unwrap();
             assert_eq!(decoded.body, Some(body));
+        }
+    }
+
+    #[test]
+    fn player_list_and_percentile_validation()
+    {
+        let player = crate::PlayerInfo {
+            uuid: "069a79f4-44e9-4726-a5be-fca90e38aaf5".to_owned(),
+            name: "Player_123456789".to_owned(),
+            online_since_unix_ms: 1234,
+            operator: true,
+        };
+        let health = Health {
+            player_list: vec![player.clone(); 500],
+            mspt_p50_ms: 5.0,
+            mspt_p99_ms: MAX_MSPT,
+            ..Default::default()
+        };
+        assert!(validate_health(&health).is_ok());
+        assert!(
+            decode_guest_message(&guest(GuestBody::Health(health.clone()))).is_err(),
+            "full player list must still obey frame bound"
+        );
+        let mut too_many = health.clone();
+        too_many.player_list.push(player.clone());
+        assert_eq!(
+            validate_health(&too_many),
+            Err(GuestProtoError::OutOfRange {
+                field: "player_list"
+            })
+        );
+        for name in ["", "abcdefghijklmnopq", "non_ascii_é", "bad-name"]
+        {
+            let bad = Health {
+                player_list: vec![crate::PlayerInfo {
+                    name: name.to_owned(),
+                    ..player.clone()
+                }],
+                ..Default::default()
+            };
+            assert!(validate_health(&bad).is_err());
+        }
+        for value in [f64::NAN, f64::INFINITY, -1.0, MAX_MSPT + 1.0]
+        {
+            assert!(
+                validate_health(&Health {
+                    mspt_p50_ms: value,
+                    ..Default::default()
+                })
+                .is_err()
+            );
+            assert!(
+                validate_health(&Health {
+                    mspt_p99_ms: value,
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        let bad_uuid = Health {
+            player_list: vec![crate::PlayerInfo {
+                uuid: "not-a-uuid".to_owned(),
+                ..player
+            }],
+            ..Default::default()
+        };
+        assert!(validate_health(&bad_uuid).is_err());
+    }
+
+    #[test]
+    fn console_output_bounds_and_round_trip()
+    {
+        let output = crate::ConsoleOutput {
+            request_id: "operation-1".to_owned(),
+            lines: vec!["line".to_owned(); 64],
+        };
+        assert_eq!(
+            decode_guest_message(&guest(GuestBody::ConsoleOutput(output.clone())))
+                .unwrap()
+                .body,
+            Some(GuestBody::ConsoleOutput(output.clone()))
+        );
+        for bad in [
+            crate::ConsoleOutput {
+                lines: vec!["x".to_owned(); 65],
+                ..output.clone()
+            },
+            crate::ConsoleOutput {
+                lines: vec!["x".repeat(MAX_LOG_LINE_BYTES + 1)],
+                ..output.clone()
+            },
+            crate::ConsoleOutput {
+                lines: vec!["line\nline".to_owned()],
+                ..output.clone()
+            },
+            crate::ConsoleOutput {
+                lines: vec!["x".repeat(MAX_LOG_LINE_BYTES); 64],
+                ..output.clone()
+            },
+            crate::ConsoleOutput {
+                request_id: "x".repeat(MAX_INSTANCE_ID_BYTES + 1),
+                ..output.clone()
+            },
+            crate::ConsoleOutput {
+                request_id: String::new(),
+                ..output
+            },
+        ]
+        {
+            assert!(decode_guest_message(&guest(GuestBody::ConsoleOutput(bad))).is_err());
         }
     }
 
@@ -526,19 +713,37 @@ mod tests
     }
 
     #[test]
+    fn mutating_console_commands_require_a_replay_identity()
+    {
+        let command = |command: &str| {
+            host(HostBody::ConsoleCommand(ConsoleCommand {
+                command: command.to_owned(),
+                request_id: String::new(),
+            }))
+        };
+        assert!(decode_host_message(&command("say message")).is_err());
+        for probe in ["list", "list uuids", "tps", "mspt"]
+        {
+            assert!(decode_host_message(&command(probe)).is_ok());
+        }
+    }
+
+    #[test]
     fn console_command_limits()
     {
         let at_limit = "x".repeat(MAX_CONSOLE_COMMAND_BYTES);
         assert!(
             decode_host_message(&host(HostBody::ConsoleCommand(ConsoleCommand {
-                command: at_limit
+                command: at_limit,
+                request_id: "test-command".to_owned(),
             })))
             .is_ok()
         );
         let over = "x".repeat(MAX_CONSOLE_COMMAND_BYTES + 1);
         assert_eq!(
             decode_host_message(&host(HostBody::ConsoleCommand(ConsoleCommand {
-                command: over
+                command: over,
+                request_id: "test-command".to_owned(),
             }))),
             Err(GuestProtoError::TooLong {
                 field: "command",
@@ -549,7 +754,8 @@ mod tests
         {
             assert_eq!(
                 decode_host_message(&host(HostBody::ConsoleCommand(ConsoleCommand {
-                    command: command.to_owned()
+                    command: command.to_owned(),
+                    request_id: "test-command".to_owned(),
                 }))),
                 Err(GuestProtoError::ForbiddenCharacter { field: "command" })
             );

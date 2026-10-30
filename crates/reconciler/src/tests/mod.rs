@@ -319,6 +319,7 @@ impl Fixture
                 world_id: "world-1".to_owned(),
                 egress_mbit: 100,
                 ports: vec![25565],
+                ..Default::default()
             }),
             env,
             restart_policy: RestartPolicy::Never as i32,

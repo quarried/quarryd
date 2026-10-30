@@ -6,9 +6,10 @@ mod tun;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::ErrorKind;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock};
 
 use async_trait::async_trait;
 use rtnetlink::Handle;
@@ -23,9 +24,14 @@ use crate::ipam::{mac_with_prefix, parse_mac};
 use crate::names::InterfaceNames;
 use crate::nft::{self, WorldMembership, world_set_name};
 use crate::node::NodeNetwork;
+use crate::public::PublicState;
+use crate::responder::SleepResponder;
 use crate::subnet::Subnet;
 use crate::wireguard::{self, IpPrefix, is_valid_key};
-use crate::{Network, NetworkingConfig, ensure_subnet_change_allowed, state_file, tc};
+use crate::{
+    Network, NetworkingConfig, PublicIpMetrics, PublicIpMode, PublicIpv4Config, PublicWake,
+    ensure_subnet_change_allowed, state_file, tc,
+};
 
 pub const GATEWAY_LINK: &str = "quarry0";
 const STATE_FILE: &str = "network-state.json";
@@ -36,6 +42,10 @@ struct PersistedState
 {
     node: Option<NodeNetwork>,
     instances: BTreeMap<String, InstanceRecord>,
+    #[serde(default)]
+    public: PublicState,
+    #[serde(skip)]
+    applied_public: Option<PublicState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +96,8 @@ pub struct Networking
     state_path: PathBuf,
     key_path: PathBuf,
     state: Mutex<PersistedState>,
+    public_claims: RwLock<PublicState>,
+    responder: SleepResponder,
 }
 
 impl Networking
@@ -96,11 +108,13 @@ impl Networking
             .map_err(|e| NetworkError::io(format!("creating {}", config.state_dir.display()), e))?;
         let state_path = config.state_dir.join(STATE_FILE);
         let key_path = config.state_dir.join(WIREGUARD_KEY_FILE);
-        let state = state_file::load(&state_path)?.unwrap_or_default();
+        let state: PersistedState = state_file::load(&state_path)?.unwrap_or_default();
         Ok(Networking {
             config,
             state_path,
             key_path,
+            public_claims: RwLock::new(state.public.clone()),
+            responder: SleepResponder::new(Ipv4Addr::UNSPECIFIED),
             state: Mutex::new(state),
         })
     }
@@ -112,7 +126,46 @@ impl Networking
 
     fn persist(&self, state: &PersistedState) -> Result<(), NetworkError>
     {
-        state_file::save(&self.state_path, state)
+        state_file::save(&self.state_path, state)?;
+        *self
+            .public_claims
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = state.public.clone();
+        Ok(())
+    }
+
+    async fn apply_public(&self, state: &mut PersistedState) -> Result<(), NetworkError>
+    {
+        self.responder.prepare(&mut state.public)?;
+        if state.applied_public.as_ref() == Some(&state.public)
+        {
+            return Ok(());
+        }
+        self.persist(state)?;
+        self.apply_nft(&nft::public_rules(&state.public), None)
+            .await?;
+        let desired = state.public.proxies();
+        if !desired.is_empty() || !state.public.retired_proxies.is_empty()
+        {
+            let host = netlink::connect()?;
+            for proxy in state.public.retired_proxies.difference(&desired)
+            {
+                netlink::remove_proxy_neighbour(&host, &proxy.interface, proxy.address).await?;
+            }
+            for proxy in &desired
+            {
+                write_sysctl(
+                    &format!("/proc/sys/net/ipv4/conf/{}/proxy_arp", proxy.interface),
+                    "1",
+                )?;
+                netlink::replace_proxy_neighbour(&host, &proxy.interface, proxy.address).await?;
+            }
+        }
+        state.public.retired_proxies.clear();
+        self.persist(state)?;
+        self.responder.publish(&state.public);
+        state.applied_public = Some(state.public.clone());
+        Ok(())
     }
 
     async fn apply_nft(&self, ruleset: &Value, netns: Option<&File>) -> Result<(), NetworkError>
@@ -391,6 +444,67 @@ fn write_sysctl(path: &str, value: &str) -> Result<(), NetworkError>
 #[async_trait]
 impl Network for Networking
 {
+    async fn configure_public(&self, config: &PublicIpv4Config) -> Result<(), NetworkError>
+    {
+        let mut state = self.state.lock().await;
+        state.public.configure(config)?;
+        self.apply_public(&mut state).await
+    }
+
+    fn validate_public_ipv4(&self, instance_id: &str, address: &str) -> Result<(), NetworkError>
+    {
+        self.public_claims
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .validate(instance_id, address)
+    }
+
+    async fn attach_public(&self, instance_id: &str, address: Ipv4Addr)
+    -> Result<(), NetworkError>
+    {
+        let mut state = self.state.lock().await;
+        let guest_ip = state
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| NetworkError::NotAttached(instance_id.to_string()))?
+            .spec
+            .guest_ip;
+        state.public.attach(instance_id, address, guest_ip)?;
+        self.apply_public(&mut state).await
+    }
+
+    async fn detach_public(&self, instance_id: &str) -> Result<(), NetworkError>
+    {
+        let mut state = self.state.lock().await;
+        state.public.remove(instance_id);
+        self.apply_public(&mut state).await
+    }
+
+    async fn set_public_mode(
+        &self,
+        instance_id: &str,
+        mode: PublicIpMode,
+    ) -> Result<(), NetworkError>
+    {
+        let mut state = self.state.lock().await;
+        if let Some(binding) = state.public.bindings.get_mut(instance_id)
+        {
+            binding.mode = mode;
+            self.apply_public(&mut state).await?;
+        }
+        Ok(())
+    }
+
+    fn subscribe_wakes(&self) -> tokio::sync::broadcast::Receiver<PublicWake>
+    {
+        self.responder.subscribe()
+    }
+
+    fn public_metrics(&self) -> PublicIpMetrics
+    {
+        self.responder.metrics()
+    }
+
     async fn configure_node(&self, node: &NodeNetwork) -> Result<(), NetworkError>
     {
         node.validate()?;
@@ -420,6 +534,7 @@ impl Network for Networking
         }
         state.node = Some(node.clone());
         self.persist(&state)?;
+        self.apply_public(&mut state).await?;
         info!(subnet = %node.subnet, region = %node.region, "node network configured");
         Ok(())
     }
@@ -492,6 +607,11 @@ impl Network for Networking
         {
             record.complete = true;
         }
+        if let Some(binding) = state.public.bindings.get_mut(&spec.instance_id)
+        {
+            binding.guest_ip = spec.guest_ip;
+            self.apply_public(&mut state).await?;
+        }
         self.persist(&state)?;
         info!(instance_id = %spec.instance_id, guest_ip = %spec.guest_ip, mode = ?spec.mode, "instance network attached");
         Ok(spec.attachment(subnet))
@@ -500,6 +620,8 @@ impl Network for Networking
     async fn detach(&self, instance_id: &str) -> Result<(), NetworkError>
     {
         let mut state = self.state.lock().await;
+        state.public.remove(instance_id);
+        self.apply_public(&mut state).await?;
         self.remove_instance(&state, instance_id).await?;
         if state.instances.remove(instance_id).is_some()
         {

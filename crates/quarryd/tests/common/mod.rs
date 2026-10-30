@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 pub const GUEST_ENTRY: &str = "guest_entry";
 
-pub const FAKE_SERVER: &str = r#"echo "Starting minecraft server version 1.21.1"; echo "Done (0.1s)! For help, type \"help\""; while read line; do echo "$line" >> "$QUARRY_TEST_COMMAND_LOG"; case "$line" in stop) echo "Saving worlds"; exit 0;; list) echo "There are 0 of a max of 20 players online: ";; tps) echo "TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0";; *) echo "$line";; esac; done"#;
+pub const FAKE_SERVER: &str = r#"echo "Starting minecraft server version 1.21.1"; echo "Done (0.1s)! For help, type \"help\""; while read line; do echo "$line" >> "$QUARRY_TEST_COMMAND_LOG"; case "$line" in stop) echo "Saving worlds"; exit 0;; list|"list uuids") echo "There are 0 of a max of 20 players online: ";; tps) echo "TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0";; *) echo "$line";; esac; done"#;
 
 pub fn run_guest_if_requested()
 {
@@ -26,6 +26,7 @@ pub fn run_guest_if_requested()
         return;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -219,6 +220,7 @@ ready_timeout_secs = 20
                 world_id: "world-1".to_string(),
                 egress_mbit: 100,
                 ports: vec![25565],
+                ..Default::default()
             }),
             env,
             restart_policy: RestartPolicy::Always as i32,
@@ -236,7 +238,7 @@ ready_timeout_secs = 20
     {
         let id = id.to_string();
         self.control
-            .wait_for(Duration::from_secs(60), move |message| {
+            .wait_for(Duration::from_secs(60), |message| {
                 match &message.body
                 {
                     Some(AgentBody::Status(status)) =>
@@ -250,7 +252,8 @@ ready_timeout_secs = 20
             })
             .await
             .unwrap_or_else(|| {
-                panic!("instance never reached {phase:?} at generation {generation}")
+                let console = std::fs::read_to_string(self.path(&format!("state/fake-sandbox/{id}/console.log"))).unwrap_or_default();
+                panic!("instance never reached {phase:?} at generation {generation}; console: {console}")
             })
     }
 
@@ -263,6 +266,66 @@ ready_timeout_secs = 20
     {
         let store = store::Store::open_read_only(&self.path("state/quarryd.db")).ok()?;
         store.get_instance(id).ok()??.pid
+    }
+}
+
+impl Drop for Harness
+{
+    fn drop(&mut self)
+    {
+        let Ok(store) = store::Store::open_read_only(&self.path("state/quarryd.db"))
+        else
+        {
+            return;
+        };
+        let Ok(rows) = store.list_instances()
+        else
+        {
+            return;
+        };
+        let records: Vec<sandbox::SandboxRecord> = rows
+            .into_iter()
+            .filter_map(|row| {
+                row.sandbox_record
+                    .and_then(|record| serde_json::from_str(&record).ok())
+            })
+            .collect();
+        if records.is_empty()
+        {
+            return;
+        }
+        let state_dir = self.path("state/fake-sandbox");
+        let task = std::thread::Builder::new()
+            .name("test-sandbox-cleanup".to_owned())
+            .spawn(move || {
+                use sandbox::Sandbox;
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else
+                {
+                    return;
+                };
+                let backend = sandbox::fake::FakeSandbox::new(sandbox::fake::FakeConfig {
+                    state_dir,
+                    ..Default::default()
+                });
+                runtime.block_on(async {
+                    for record in records
+                    {
+                        if let Ok(Some(handle)) = backend.adopt(&record).await
+                        {
+                            let _ = backend
+                                .shutdown(&handle, sandbox::ShutdownMode::Force)
+                                .await;
+                        }
+                    }
+                });
+            });
+        if let Ok(task) = task
+        {
+            let _ = task.join();
+        }
     }
 }
 

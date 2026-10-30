@@ -110,6 +110,7 @@ fn control_kind(body: &ControlBody) -> &'static str
         ControlBody::Lease(_) => "lease_grant",
         ControlBody::Update(_) => "agent_update",
         ControlBody::Desired(_) => "desired_state",
+        ControlBody::Live(_) => "live_metrics",
     }
 }
 
@@ -224,6 +225,8 @@ impl ControlChannel
         {
             return Disconnect::Stream(error);
         }
+        let mut health = self.reconciler.subscribe_health();
+        let mut wakes = self.reconciler.subscribe_wakes();
         let mut heartbeat = tokio::time::interval(self.settings.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut rotation_check = tokio::time::interval(Duration::from_secs(600));
@@ -256,6 +259,23 @@ impl ControlChannel
                             }
                         }
                         None => return Disconnect::Shutdown,
+                    }
+                }
+                sample = health.recv() => {
+                    if let Ok(sample) = sample
+                        && let Err(error) = self.send_unnumbered(AgentBody::Health(sample), &sender).await
+                    {
+                        return Disconnect::Stream(error);
+                    }
+                }
+                wake = wakes.recv() => {
+                    if let Ok(wake) = wake
+                        && let Err(error) = self.send_unnumbered(AgentBody::Wake(proto::v1::WakeRequest {
+                            instance_id: wake.instance_id,
+                            requested_at_unix_ms: wake.requested_at_unix_ms,
+                        }), &sender).await
+                    {
+                        return Disconnect::Stream(error);
                     }
                 }
                 result = self.operations.next_result() => {
@@ -466,7 +486,8 @@ impl ControlChannel
         };
         let seq = message.seq;
         let kind = control_kind(&body);
-        let is_desired = matches!(body, ControlBody::Desired(_));
+        let is_desired = matches!(body, ControlBody::Desired(_))
+            || (seq == 0 && matches!(body, ControlBody::Live(_)));
         if seq == 0 && !is_desired
         {
             warn!(kind, "ignoring unnumbered control message");
@@ -505,6 +526,7 @@ impl ControlChannel
             }
             ControlBody::Update(update) => self.updater.begin(update),
             ControlBody::Desired(desired) => self.reconciler.apply_desired_state(desired).await?,
+            ControlBody::Live(live) => self.reconciler.set_live_metrics(live),
         }
         if seq != 0
         {

@@ -278,6 +278,7 @@ mod tests
         let bad = HostMessage {
             body: Some(HostBody::ConsoleCommand(ConsoleCommand {
                 command: "stop\nop me".to_owned(),
+                ..Default::default()
             })),
         };
         assert!(decode_host(&bad.encode_to_vec()).is_err());

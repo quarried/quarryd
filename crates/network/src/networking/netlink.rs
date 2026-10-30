@@ -5,7 +5,7 @@ use std::path::Path;
 use futures::TryStreamExt;
 use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
 use rtnetlink::packet_route::link::{InfoData, InfoVeth, LinkAttribute, LinkMessage};
-use rtnetlink::packet_route::neighbour::NeighbourState;
+use rtnetlink::packet_route::neighbour::{NeighbourFlags, NeighbourState};
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
 };
@@ -322,6 +322,62 @@ pub(crate) async fn replace_permanent_neighbour(
         .execute()
         .await
         .map_err(|e| netlink_error(format!("pinning neighbour {ip} on link {index}"), e))
+}
+
+pub(crate) async fn replace_proxy_neighbour(
+    handle: &Handle,
+    interface: &str,
+    address: Ipv4Addr,
+) -> Result<(), NetworkError>
+{
+    let index = require_link_index(handle, interface).await?;
+    handle
+        .neighbours()
+        .add(index, IpAddr::V4(address))
+        .flags(NeighbourFlags::Proxy)
+        .state(NeighbourState::Permanent)
+        .replace()
+        .execute()
+        .await
+        .map_err(|error| {
+            netlink_error(
+                format!("adding proxy neighbour {address} on {interface}"),
+                error,
+            )
+        })
+}
+
+pub(crate) async fn remove_proxy_neighbour(
+    handle: &Handle,
+    interface: &str,
+    address: Ipv4Addr,
+) -> Result<(), NetworkError>
+{
+    let Some(index) = link_index(handle, interface).await?
+    else
+    {
+        return Ok(());
+    };
+    let mut request = handle
+        .neighbours()
+        .add(index, IpAddr::V4(address))
+        .flags(NeighbourFlags::Proxy);
+    let message = request.message_mut().clone();
+    match handle.neighbours().del(message).execute().await
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if is_errno(&error, libc::ENOENT)
+                || is_errno(&error, libc::ESRCH)
+                || is_errno(&error, libc::ENODEV) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(netlink_error(
+            format!("removing proxy neighbour {address} on {interface}"),
+            error,
+        )),
+    }
 }
 
 fn route_destination(route: &RouteMessage) -> Option<IpPrefix>

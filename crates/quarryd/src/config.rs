@@ -10,6 +10,12 @@ use serde::Deserialize;
 pub struct Config
 {
     pub node_id: String,
+    #[serde(default)]
+    pub public_ipv4_pool: Vec<String>,
+    #[serde(default)]
+    pub uplink_interface: String,
+    #[serde(default)]
+    pub public_ipv4_arp: network::PublicIpv4Arp,
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
     pub endpoints: Vec<String>,
@@ -515,6 +521,18 @@ public_key = "RWQ"
             config.database_path(),
             PathBuf::from("/var/lib/quarryd/quarryd.db")
         );
+    }
+
+    #[test]
+    fn public_ipv4_configuration_defaults_to_routed()
+    {
+        let config = Config::parse(MINIMAL).unwrap();
+        assert!(config.public_ipv4_pool.is_empty());
+        assert_eq!(config.public_ipv4_arp, network::PublicIpv4Arp::Routed);
+        let config = Config::parse(&format!("public_ipv4_pool = [\"203.0.113.80/32\"]\nuplink_interface = \"eth0\"\npublic_ipv4_arp = \"proxy\"\n{MINIMAL}")).unwrap();
+        assert_eq!(config.public_ipv4_pool, vec!["203.0.113.80/32"]);
+        assert_eq!(config.uplink_interface, "eth0");
+        assert_eq!(config.public_ipv4_arp, network::PublicIpv4Arp::Proxy);
     }
 
     #[test]

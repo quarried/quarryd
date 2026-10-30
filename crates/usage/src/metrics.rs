@@ -68,6 +68,9 @@ struct MetricsState
     instance_usage: BTreeMap<String, InstanceUsage>,
     guest_health: BTreeMap<String, GuestHealth>,
     pool_used_percent: Option<f64>,
+    public_bound: u64,
+    responder_connections: BTreeMap<String, u64>,
+    wake_requests: u64,
 }
 
 pub struct Metrics
@@ -150,6 +153,19 @@ impl Metrics
         self.state()
             .guest_health
             .insert(instance_id.to_string(), GuestHealth { tps, mspt, players });
+    }
+
+    pub fn set_public_network(
+        &self,
+        bound: u64,
+        connections: BTreeMap<String, u64>,
+        wake_requests: u64,
+    )
+    {
+        let mut state = self.state();
+        state.public_bound = bound;
+        state.responder_connections = connections;
+        state.wake_requests = wake_requests;
     }
 
     pub fn set_pool_used_percent(&self, percent: f64)
@@ -275,6 +291,43 @@ impl Metrics
             &[("node_id", &node)],
             &format_float(hit_ratio),
         );
+
+        for (name, help, kind, value) in [
+            (
+                "quarryd_public_ipv4_bound",
+                "Public IPv4 addresses bound to instances.",
+                "gauge",
+                state.public_bound,
+            ),
+            (
+                "quarryd_wake_requests_total",
+                "Wake requests emitted by the sleep responder.",
+                "counter",
+                state.wake_requests,
+            ),
+        ]
+        {
+            header(&mut out, name, help, kind);
+            sample(&mut out, name, &[("node_id", &node)], &value.to_string());
+        }
+        header(
+            &mut out,
+            "quarryd_responder_connections_total",
+            "Sleep responder connections by outcome.",
+            "counter",
+        );
+        for (outcome, count) in &state.responder_connections
+        {
+            sample(
+                &mut out,
+                "quarryd_responder_connections_total",
+                &[
+                    ("node_id", &node),
+                    ("outcome", &escape_label_value(outcome)),
+                ],
+                &count.to_string(),
+            );
+        }
 
         render_instance_usage(&mut out, &node, &state.instance_usage);
         render_guest_health(&mut out, &node, &state.guest_health);
@@ -504,6 +557,23 @@ mod tests
     fn lines(text: &str) -> Vec<&str>
     {
         text.lines().collect()
+    }
+
+    #[test]
+    fn renders_public_network_counters()
+    {
+        let metrics = Metrics::new("node-a");
+        metrics.set_public_network(
+            2,
+            BTreeMap::from([("status".to_owned(), 7), ("login".to_owned(), 3)]),
+            1,
+        );
+        let text = metrics.render();
+        assert!(text.contains(r#"quarryd_public_ipv4_bound{node_id="node-a"} 2"#));
+        assert!(text.contains(
+            r#"quarryd_responder_connections_total{node_id="node-a",outcome="status"} 7"#
+        ));
+        assert!(text.contains(r#"quarryd_wake_requests_total{node_id="node-a"} 1"#));
     }
 
     #[test]

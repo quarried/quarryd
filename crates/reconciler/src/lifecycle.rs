@@ -27,6 +27,7 @@ impl Lifecycle
 
     const ADMISSION: &'static [(Phase, Phase)] = &[
         (Phase::Pending, Phase::Rejected),
+        (Phase::Pending, Phase::Stopped),
         (Phase::Stopped, Phase::Rejected),
         (Phase::Failed, Phase::Rejected),
         (Phase::Rejected, Phase::Pending),

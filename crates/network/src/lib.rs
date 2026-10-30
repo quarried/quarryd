@@ -5,6 +5,8 @@ mod ipam;
 mod names;
 pub mod nft;
 mod node;
+mod public;
+mod responder;
 mod state_file;
 mod subnet;
 pub mod tc;
@@ -13,6 +15,7 @@ pub mod wireguard;
 #[cfg(target_os = "linux")]
 mod networking;
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -34,6 +37,18 @@ pub use subnet::Subnet;
 pub trait Network: Send + Sync
 {
     async fn configure_node(&self, node: &NodeNetwork) -> Result<(), NetworkError>;
+    async fn configure_public(&self, config: &PublicIpv4Config) -> Result<(), NetworkError>;
+    fn validate_public_ipv4(&self, instance_id: &str, address: &str) -> Result<(), NetworkError>;
+    async fn attach_public(&self, instance_id: &str, address: Ipv4Addr)
+    -> Result<(), NetworkError>;
+    async fn detach_public(&self, instance_id: &str) -> Result<(), NetworkError>;
+    async fn set_public_mode(
+        &self,
+        instance_id: &str,
+        mode: PublicIpMode,
+    ) -> Result<(), NetworkError>;
+    fn subscribe_wakes(&self) -> tokio::sync::broadcast::Receiver<PublicWake>;
+    fn public_metrics(&self) -> PublicIpMetrics;
     async fn attach(&self, spec: &InstanceNetworkSpec) -> Result<NetworkAttachment, NetworkError>;
     async fn detach(&self, instance_id: &str) -> Result<(), NetworkError>;
     async fn counters(
@@ -84,4 +99,45 @@ pub(crate) fn ensure_subnet_change_allowed(
         }
         _ => Ok(()),
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PublicIpv4Arp
+{
+    #[default]
+    Routed,
+    Proxy,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublicIpv4Config
+{
+    pub pool: Vec<String>,
+    pub uplink_interface: String,
+    pub arp: PublicIpv4Arp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PublicIpMode
+{
+    Running,
+    Stopped,
+    Hibernated,
+    Starting,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicWake
+{
+    pub instance_id: String,
+    pub requested_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PublicIpMetrics
+{
+    pub bound: u64,
+    pub connections: std::collections::BTreeMap<String, u64>,
+    pub wake_requests: u64,
 }

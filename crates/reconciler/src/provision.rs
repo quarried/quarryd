@@ -131,6 +131,33 @@ impl Supervisor
         };
         let attachment = self.inner.parts.network.attach(&attach).await?;
         self.attachment = Some(attachment.clone());
+        if network.public_ipv4.is_empty()
+        {
+            self.inner.parts.network.detach_public(&self.id).await?;
+        }
+        else
+        {
+            self.inner
+                .parts
+                .network
+                .validate_public_ipv4(&self.id, &network.public_ipv4)?;
+            let address = network.public_ipv4.parse().map_err(|_| {
+                network::NetworkError::InvalidNodeNetwork(format!(
+                    "invalid public IPv4 {}",
+                    network.public_ipv4
+                ))
+            })?;
+            self.inner
+                .parts
+                .network
+                .attach_public(&self.id, address)
+                .await?;
+            self.inner
+                .parts
+                .network
+                .set_public_mode(&self.id, network::PublicIpMode::Starting)
+                .await?;
+        }
         self.commit()?;
         self.checkpoint("after-attach").await;
         tracing::info!(
@@ -176,6 +203,7 @@ impl Supervisor
             .first()
             .ok_or(ReconcilerError::MissingField("disk"))?;
         let name = volume_name(&self.id, &disk.name);
+        self.inner.parts.store.remember_disk(&self.id, &name)?;
         let size = disk.size_gib.saturating_mul(GIB);
         let volumes = &self.inner.parts.volumes;
         let manifest = disk
@@ -225,6 +253,36 @@ impl Supervisor
         snapshots.restore(&manifest, &info.path).await?;
         store.kv_set(&key, format!("{RESTORE_DONE}{manifest}").as_bytes())?;
         Ok(info)
+    }
+
+    pub(crate) async fn cleanup_replaced_disks(&self) -> Result<(), ReconcilerError>
+    {
+        let _disk_guard = self.inner.disk_lock.lock().await;
+        let Some(row) = self.inner.parts.store.get_instance(&self.id)?
+        else
+        {
+            return Ok(());
+        };
+        if row.generation != self.observed_generation || row.desired_deleted
+        {
+            return Ok(());
+        }
+        let desired = crate::reconciler::decode_spec(&row.spec)?;
+        let keep: Vec<String> = desired
+            .disks
+            .iter()
+            .map(|disk| volume_name(&self.id, &disk.name))
+            .collect();
+        for name in self.inner.parts.store.instance_disks(&self.id)?
+        {
+            if !keep.contains(&name)
+            {
+                self.inner.parts.volumes.remove(&name).await?;
+                self.inner.parts.store.kv_delete(&restore_key(&name))?;
+                self.inner.parts.store.forget_disk(&self.id, &name)?;
+            }
+        }
+        Ok(())
     }
 
     fn sandbox_spec(&self, prepared: &Prepared, spec: &InstanceSpec) -> SandboxSpec
@@ -298,6 +356,7 @@ impl Supervisor
     ) -> Result<(), ReconcilerError>
     {
         let parts = &self.inner.parts;
+        parts.network.detach_public(&self.id).await?;
         parts.network.detach(&self.id).await?;
         if let Some(ipam) = lock(&self.inner.ipam).as_mut()
         {
@@ -306,9 +365,15 @@ impl Supervisor
         self.checkpoint("after-detach").await;
         for disk in &spec.disks
         {
-            let name = volume_name(&self.id, &disk.name);
+            parts
+                .store
+                .remember_disk(&self.id, &volume_name(&self.id, &disk.name))?;
+        }
+        for name in parts.store.instance_disks(&self.id)?
+        {
             parts.volumes.remove(&name).await?;
             parts.store.kv_delete(&restore_key(&name))?;
+            parts.store.forget_disk(&self.id, &name)?;
         }
         parts.images.release_instance(&self.id)?;
         let dir = self.inner.config.state_dir.join(&self.id);

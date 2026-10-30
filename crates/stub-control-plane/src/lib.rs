@@ -141,6 +141,15 @@ impl StubControlPlane
         state.network = network;
     }
 
+    pub async fn live_metrics(&self, live: proto::v1::LiveMetrics) -> u64
+    {
+        self.shared
+            .state
+            .lock()
+            .await
+            .push(control_message::Body::Live(live))
+    }
+
     /// Sends a `DesiredState` with the current desired state now.
     pub async fn send_desired(&self) -> u64
     {

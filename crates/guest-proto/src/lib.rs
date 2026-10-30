@@ -13,8 +13,9 @@ mod validate;
 
 pub use frame::{FrameError, MAX_FRAME_BYTES, MAX_HOST_FRAME_BYTES, read_frame, write_message};
 pub use messages::{
-    Configure, ConsoleCommand, GuestBody, GuestMessage, Health, HostBody, HostMessage, Log,
-    PrepareSnapshot, Ready, ResumeWrites, Shutdown, ShutdownComplete, SnapshotPrepared,
+    Configure, ConsoleCommand, ConsoleOutput, GuestBody, GuestMessage, Health, HostBody,
+    HostMessage, Log, PlayerInfo, PrepareSnapshot, Ready, ResumeWrites, Shutdown, ShutdownComplete,
+    SnapshotPrepared,
 };
 pub use rate::RateLimiter;
 pub use transport::Transport;

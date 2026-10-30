@@ -1,12 +1,14 @@
+use prost::Message;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use guest_proto::{
-    Configure, GuestBody, GuestMessage, Health, HostBody, HostMessage, Log, MAX_ERROR_BYTES,
-    MAX_HEAP_BYTES, MAX_LOG_LINE_BYTES, RateLimiter, Ready, SERVER_BINARY_PATH, ShutdownComplete,
-    SnapshotPrepared,
+    Configure, ConsoleOutput, GuestBody, GuestMessage, Health, HostBody, HostMessage, Log,
+    MAX_ERROR_BYTES, MAX_HEAP_BYTES, MAX_LOG_LINE_BYTES, RateLimiter, Ready, SERVER_BINARY_PATH,
+    ShutdownComplete, SnapshotPrepared,
 };
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -18,7 +20,8 @@ use crate::server::{self, DATA_DIR, Server};
 use crate::snapshot::{self, FreezeOutcome};
 use crate::{EXIT_FAILURE, EXIT_OK, READY_PATTERN_ENV, Settings, output, secrets, world};
 
-const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const CONSOLE_WINDOW: Duration = Duration::from_millis(500);
 const SAVE_TIMEOUT: Duration = Duration::from_secs(30);
 const FREEZE_LIMIT: Duration = Duration::from_secs(60);
 const TERMINATE_DEADLINE: Duration = Duration::from_secs(30);
@@ -34,6 +37,7 @@ pub enum Event
     Host(u64, HostMessage),
     Disconnected(u64),
     ServerLine(String),
+    ServerStderr(String),
     ServerExited(i32),
     Frozen(Result<FreezeOutcome, String>),
     Thawed(Result<(), String>),
@@ -117,6 +121,9 @@ struct Agent
     frozen: bool,
     stopping: Option<Stopping>,
     ready_patterns: Vec<String>,
+    console_capture: HashMap<String, (Instant, ConsoleOutput)>,
+    console_seen: HashSet<String>,
+    console_results: VecDeque<ConsoleOutput>,
 }
 
 pub async fn run(settings: Settings) -> i32
@@ -169,6 +176,9 @@ pub async fn run(settings: Settings) -> i32
         frozen: false,
         stopping: None,
         ready_patterns,
+        console_capture: HashMap::new(),
+        console_seen: HashSet::new(),
+        console_results: VecDeque::new(),
     };
     loop
     {
@@ -208,10 +218,21 @@ impl Agent
     {
         let stop = self.stopping.as_ref().and_then(Stopping::next_deadline);
         let probe = self.prober.deadline().map(Instant::from_std);
-        [stop, probe, self.snapshot.deadline(), self.next_health]
-            .into_iter()
-            .flatten()
-            .min()
+        let console = self
+            .console_capture
+            .values()
+            .map(|(deadline, _)| *deadline)
+            .min();
+        [
+            stop,
+            probe,
+            self.snapshot.deadline(),
+            self.next_health,
+            console,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     async fn handle(&mut self, event: Event) -> Option<i32>
@@ -245,6 +266,12 @@ impl Agent
                 None
             }
             Event::ServerLine(line) =>
+            {
+                self.capture_line(&line);
+                self.on_server_line(line);
+                None
+            }
+            Event::ServerStderr(line) =>
             {
                 self.on_server_line(line);
                 None
@@ -319,13 +346,53 @@ impl Agent
             HostBody::Configure(configure) => self.on_configure(configure).await,
             HostBody::ConsoleCommand(console) =>
             {
-                if self.server.is_some()
+                if console.request_id.is_empty()
                 {
                     self.command(&console.command);
+                    return None;
                 }
-                else
+                if let Some(result) = self
+                    .console_results
+                    .iter()
+                    .find(|result| result.request_id == console.request_id)
                 {
-                    log!("dropping a console command: the server is not running");
+                    self.send(GuestBody::ConsoleOutput(result.clone()));
+                    return None;
+                }
+                if self.console_capture.contains_key(&console.request_id)
+                {
+                    return None;
+                }
+                let mut result = ConsoleOutput {
+                    request_id: console.request_id.clone(),
+                    lines: Vec::new(),
+                };
+                if !self.console_seen.insert(console.request_id.clone())
+                {
+                    self.send(GuestBody::ConsoleOutput(result));
+                    return None;
+                }
+                let written = match &self.server
+                {
+                    Some(server) => server.console_command(&console.command).await,
+                    None => Err(std::io::Error::other("server is not running")),
+                };
+                match written
+                {
+                    Ok(()) =>
+                    {
+                        self.console_capture.insert(
+                            console.request_id,
+                            (Instant::now() + CONSOLE_WINDOW, result),
+                        );
+                    }
+                    Err(error) =>
+                    {
+                        result
+                            .lines
+                            .push(output::single_line(&error.to_string(), MAX_LOG_LINE_BYTES));
+                        self.send_console_result(result);
+                    }
                 }
                 None
             }
@@ -500,12 +567,46 @@ impl Agent
         self.forward_log(line, now);
     }
 
+    fn capture_line(&mut self, line: &str)
+    {
+        let now = Instant::now();
+        for (deadline, capture) in self.console_capture.values_mut()
+        {
+            if now <= *deadline && capture.lines.len() < 64
+            {
+                capture
+                    .lines
+                    .push(output::single_line(line, MAX_LOG_LINE_BYTES));
+                if (GuestMessage {
+                    body: Some(GuestBody::ConsoleOutput(capture.clone())),
+                })
+                .encoded_len()
+                    > guest_proto::MAX_FRAME_BYTES
+                {
+                    capture.lines.pop();
+                }
+            }
+        }
+    }
+
+    fn send_console_result(&mut self, result: ConsoleOutput)
+    {
+        self.send(GuestBody::ConsoleOutput(result.clone()));
+        self.console_results.push_back(result);
+        if self.console_results.len() > 256
+        {
+            self.console_results.pop_front();
+        }
+    }
+
     fn forward_log(&mut self, line: String, now: Instant)
     {
         self.flush_drop_notice(now);
         if self.dropped_lines == 0 && self.log_limiter.allow(now.into_std())
         {
-            self.send(GuestBody::Log(Log { line }));
+            self.send(GuestBody::Log(Log {
+                line: output::single_line(&line, MAX_LOG_LINE_BYTES),
+            }));
         }
         else
         {
@@ -546,17 +647,45 @@ impl Agent
             .as_ref()
             .map_or(0, |server| server::resident_bytes(server.pid()))
             .min(MAX_HEAP_BYTES);
-        self.send(GuestBody::Health(Health {
+        let mut health = Health {
             tps: sample.tps,
             mspt: sample.mspt,
             players: sample.players,
             heap_used_bytes,
-        }));
+            player_list: self.prober.player_list(),
+            mspt_p50_ms: self.prober.percentile(50),
+            mspt_p99_ms: self.prober.percentile(99),
+        };
+        while (GuestMessage {
+            body: Some(GuestBody::Health(health.clone())),
+        })
+        .encoded_len()
+            > guest_proto::MAX_FRAME_BYTES
+        {
+            if health.player_list.pop().is_none()
+            {
+                break;
+            }
+        }
+        self.send(GuestBody::Health(health));
     }
 
     fn on_timers(&mut self)
     {
         let now = Instant::now();
+        let complete: Vec<String> = self
+            .console_capture
+            .iter()
+            .filter(|(_, (deadline, _))| now >= *deadline)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in complete
+        {
+            if let Some((_, result)) = self.console_capture.remove(&id)
+            {
+                self.send_console_result(result);
+            }
+        }
         if let Some(stopping) = &mut self.stopping
             && !stopping.interrupt_sent
             && now >= stopping.interrupt_at
@@ -609,6 +738,7 @@ impl Agent
             self.flush_drop_notice(now);
             if self.server.is_some() && self.stopping.is_none()
             {
+                self.prober.refresh_profiles(&server::data_dir());
                 let step = self.prober.begin(now.into_std());
                 self.apply_probe_step(step);
             }
@@ -854,6 +984,10 @@ impl Agent
 
     async fn on_server_exited(&mut self, code: i32) -> i32
     {
+        for (_, (_, result)) in std::mem::take(&mut self.console_capture)
+        {
+            self.send_console_result(result);
+        }
         self.server = None;
         self.server_pid.store(0, Ordering::Relaxed);
         if self.frozen

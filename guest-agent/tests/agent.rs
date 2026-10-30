@@ -29,7 +29,7 @@ else
 fi
 while IFS= read -r line; do
   case "$line" in
-    list) echo "There are 3 of a max of 20 players online: a, b, c" ;;
+    list|"list uuids") echo "There are 3 of a max of 20 players online: a, b, c" ;;
     tps)
       if [ -n "$FAKE_QUARRY" ]; then
         echo "2026-10-30T01:35:11.000000Z  INFO TPS (5s, 1m): 18.0, 19.5 | MSPT: 0.11 ms (last 0.08 ms)"
@@ -39,6 +39,8 @@ while IFS= read -r line; do
     mspt) echo "Unknown or incomplete command, see below for error"; echo "mspt<--[HERE]" ;;
     "save-all flush") echo "> save-all flush"; echo "Saving the game (this may take a moment!)"; echo "Saved the game" ;;
     whoami) echo "pid $$" ;;
+    capture) echo "first output"; echo "stderr excluded" >&2; sleep 0.1; echo "second output"; sleep 0.6; echo "late output" ;;
+    flood) i=0; while [ "$i" -lt 100 ]; do printf 'line %s ' "$i"; head -c 4096 /dev/zero | tr '\000' x; printf '\n'; i=$((i+1)); done ;;
     crash) echo "crashing"; exit 3 ;;
     stop)
       echo "> stop"
@@ -243,8 +245,13 @@ impl Host
 
     async fn command(&mut self, command: &str)
     {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.send(HostBody::ConsoleCommand(ConsoleCommand {
             command: command.to_owned(),
+            request_id: format!(
+                "command-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
         }))
         .await;
     }
@@ -583,4 +590,108 @@ async fn a_missing_default_server_binary_fails_cleanly()
 fn mode(path: &Path) -> u32
 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[tokio::test]
+async fn console_output_is_correlated_bounded_and_replayed_without_execution()
+{
+    let harness = Harness::start();
+    let mut host = harness.configured().await;
+    let command = HostBody::ConsoleCommand(ConsoleCommand {
+        command: "capture".to_owned(),
+        request_id: "capture-1".to_owned(),
+    });
+    host.send(command.clone()).await;
+    let output = host
+        .wait_for(|body| match body
+        {
+            GuestBody::ConsoleOutput(output) if output.request_id == "capture-1" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert!(output.lines.iter().any(|line| line == "first output"));
+    assert!(output.lines.iter().any(|line| line == "second output"));
+    assert!(
+        !output
+            .lines
+            .iter()
+            .any(|line| line.contains("late output") || line.contains("stderr excluded"))
+    );
+    host.log_containing("late output").await;
+    host.send(command).await;
+    let replay = host
+        .wait_for(|body| match body
+        {
+            GuestBody::ConsoleOutput(output) if output.request_id == "capture-1" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(output, replay);
+    assert_eq!(
+        host.logs()
+            .iter()
+            .filter(|line| line.as_str() == "first output")
+            .count(),
+        1
+    );
+    host.send(HostBody::ConsoleCommand(ConsoleCommand {
+        command: "flood".to_owned(),
+        request_id: "capture-2".to_owned(),
+    }))
+    .await;
+    let output = host
+        .wait_for(|body| match body
+        {
+            GuestBody::ConsoleOutput(output) if output.request_id == "capture-2" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert!(!output.lines.is_empty());
+    assert!(output.lines.len() <= 64);
+    assert!(
+        output
+            .lines
+            .iter()
+            .all(|line| line.len() <= guest_proto::MAX_LOG_LINE_BYTES)
+    );
+    use prost::Message;
+    assert!(
+        guest_proto::GuestMessage {
+            body: Some(GuestBody::ConsoleOutput(output))
+        }
+        .encoded_len()
+            <= MAX_FRAME_BYTES
+    );
+}
+
+#[tokio::test]
+async fn console_output_is_returned_when_the_command_exits_the_server()
+{
+    let harness = Harness::start();
+    let mut host = harness.configured().await;
+    host.send(HostBody::ConsoleCommand(ConsoleCommand {
+        command: "crash".to_owned(),
+        request_id: "crash-request".to_owned(),
+    }))
+    .await;
+    let output = host
+        .wait_for(|body| match body
+        {
+            GuestBody::ConsoleOutput(output) if output.request_id == "crash-request" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert!(output.lines.iter().any(|line| line == "crashing"));
 }
