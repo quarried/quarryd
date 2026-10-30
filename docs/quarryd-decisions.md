@@ -75,3 +75,16 @@
 - 4.7 | Subnet validation? | Host bits must be clear and the prefix must be /1–/30; changes are refused while instances are attached | Catches control-plane mistakes and keeps addresses valid.
 - 9 | Network state across restarts? | state_dir/network-state.json records node config and attachments, written before changes | attach and detach work after a restart before the control plane reconnects.
 - 10 | Interface name collisions? | Names derive from a 40-bit FNV-1a hash of the instance id; a colliding attach is refused | IFNAMSIZ limits names to 15 characters.
+- 4.8 | Guest reconnect policy? | Retry forever, 100 ms doubling to 2 s; Ready re-sent on every reconnect | Adoption needs the guest to find the re-created host listener without restarting the server.
+- 4.8 | Configure for a different generation while running? | Ignored; generation changes are host-side restarts | Configure is idempotent.
+- 4.8 | Server command when Configure carries none? | /bin/sh -c "$QUARRY_SERVER_COMMAND" from the spec env, otherwise java -Xms/-Xmx at 75 % of memory_mib | Lets images and tests choose the server.
+- 4.8 | Readiness detection? | Server output line containing "Done (" (override QUARRY_READY_PATTERN) | Vanilla and Paper print it when the world is loaded.
+- 4.8 | Guest log rate? | 50 lines/s, burst 100, then a dropped-lines notice | Stays under the host's rate limiter.
+- 4.8 | Health probes? | list, tps, mspt sent to the console one at a time every 10 s; unsupported probes are disabled; heap from server VmRSS | Values are display-only.
+- 4.6 | Guest freeze? | save-off → save-all flush → wait for "Saved the game" (30 s) → sync → FIFREEZE /data only when it is its own filesystem (unsupported filesystems skip); writes resume after 60 s at the latest | Never freezes the root fs and never stays frozen if the host disappears.
+- 6 | Unrequested server exit? | Guest agent exits non-zero after draining output | The host applies the restart policy to crashes.
+- 6 | Guest exit code after SIGKILL at the deadline? | 128 + signal | Shell convention.
+- 10 | Secrets location? | tmpfs /run/quarry/secrets (0700, files 0400) when PID 1; otherwise /run/quarry/secrets, $XDG_RUNTIME_DIR, or a temp dir; QUARRY_SECRETS_DIR passed to the server | Values never logged or written to persistent disk inside the VM.
+- 4.8 | PID 1 duties in Firecracker? | Mount proc/sys/dev/run/tmp and /dev/vdb at /data, reap zombies, and on exit kill, unmount, sync, then reboot (Firecracker exits on guest reboot with reboot=k) | Firecracker has no ACPI power-off.
+- 12 | quarryctl scope? | list, show, console [--tail] [--follow], diagnostics; opens SQLite read-only and never writes | Section 10: no local API that changes state.
+- 12 | Secrets in quarryctl output? | Env keys and secret names only | Section 10.
