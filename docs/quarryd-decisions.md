@@ -61,3 +61,17 @@
 - 10 | Instance ID format? | 1–64 characters of [A-Za-z0-9-] | The jailer's --id accepts nothing else.
 - 10 | Jail layout? | <chroot_base>/firecracker/<id>/root with run/v.sock (guest vsock uds, so the host listens on run/v.sock_5252) and run/firecracker.socket; kernel and rootfs hard-linked or copied; data device re-created with mknod; guest socket chowned to the instance uid | Jailer requirements with an unprivileged VMM.
 - 3 | gVisor runtime details? | runsc --platform=systrap --network=sandbox --host-uds=open; read-only root with tmpfs /run and /tmp; all capabilities dropped; rootfs loop-mounted and data mounted by the unit's start script and unmounted by ExecStopPost | The bind-mounted guest socket needs host-uds; mounts live with the unit, not quarryd.
+- 4.7 | Is the :25565 edge proxy part of quarryd? | No; quarryd only allows host → instance traffic on declared ports and routes to the private IP | Section 1: quarryd accepts no inbound internet connections.
+- 4.7 | Topology? | Per-instance netns quarry-<hash> bind-mounted under /var/run/netns, veth pair to the host with a /32 route and proxy ARP; Firecracker adds a persistent TAP inside the netns; gateway /32 on dummy link quarry0 | Routed mode isolates tenants at L3 and the netns serves both the jailer and runsc.
+- 4.7 | Protocol of declared ports? | TCP and UDP | Ports carry no protocol; Bedrock and voice plugins use UDP.
+- 4.7 | Instance → host and unsolicited inbound traffic? | Only established/related allowed | The guest is untrusted and instances get no direct ingress.
+- 4.7 | Instance traffic over wg-quarry? | Denied | NodeNetwork carries no world membership for remote IPs, so it fails closed.
+- 4.7 | Empty world_id? | The instance forms a private world of its own | Otherwise every unlabelled instance could reach every other.
+- 4.7 | Where is the MAC enforced? | netdev ingress on the TAP inside the netns (Firecracker) or on the host-side veth (gVisor) | That hook sees every frame the guest sends.
+- 4.7 | IPv6 from instances? | Dropped | Addressing is IPv4 only.
+- 4.7 | Egress limiter? | tc ingress policer on the host veth (u32 match-all), burst max(20 ms, 64 KiB), mtu 65535; egress_mbit 0 means unlimited | Works on kernels without cls_matchall and does not drop GSO packets.
+- 4.7 | When is WireGuard configured? | Only when a listen port, address, or peers are given; keepalive 25 s; a route per allowed IP; /0 and subnet-overlapping allowed IPs rejected | Nodes may be behind NAT and peers must not hijack host routes.
+- 4.7 | WireGuard key lifecycle? | Generated lazily, stored at state_dir/wireguard.key (0600), reported in Hello | Hello needs the key before NetworkConfig arrives.
+- 4.7 | Subnet validation? | Host bits must be clear and the prefix must be /1–/30; changes are refused while instances are attached | Catches control-plane mistakes and keeps addresses valid.
+- 9 | Network state across restarts? | state_dir/network-state.json records node config and attachments, written before changes | attach and detach work after a restart before the control plane reconnects.
+- 10 | Interface name collisions? | Names derive from a 40-bit FNV-1a hash of the instance id; a colliding attach is refused | IFNAMSIZ limits names to 15 characters.
