@@ -1,0 +1,43 @@
+- 4.6 | Valid volume names? | 1–127 chars of [A-Za-z0-9+_.-], not starting with '-' or '.' | Matches LVM naming and blocks path traversal in the file-backed fake.
+- 4.6 | create on an existing volume with a different size? | Return the existing volume unchanged | Creation is idempotent; resizing is not a spec feature.
+- 4.6 | LVM create interrupted between lvcreate and mkfs? | LV tagged quarry_mkfs_pending until mkfs.ext4 -q -F succeeds; a rerun formats again | Otherwise an interrupted create would return a volume without a filesystem.
+- 4.6 | How are thin snapshots exposed? | lvcreate --snapshot --setactivationskip n --activate y --permission r; existing ones are re-activated read-only | Keeps snapshot idempotent across reboots and partial runs.
+- 4.6 | Which LVs does quarryd see? | Only thin LVs in the configured pool (snapshots included) | quarryd manages only its own pool.
+- 4.6 | File-backed fake layout? | <dir>/<name>.img sparse files written via a partial file and renamed; snapshots are read-only copies | Atomic creation so an interrupted create is never mistaken for a finished one.
+- 11 | Which thin-pool usage figure? | max(data_percent, metadata_percent) from lvs | A full metadata area breaks the pool as surely as full data.
+- 11 | Refuse at 90 % on current or projected usage? | Current usage at request time | Matches "refuse new volumes at 90 %".
+- 11 | Pool alert logging? | Log only on level change: warn at 80 %, error at 90 %, info when back below 80 % | Avoids repeating the alert on every poll.
+- 4.6 | Snapshot chunk layout? | Raw-content sha256 per chunk, zstd level 3 at <prefix>/chunks/<sha256>.zst, all-zero chunks recorded but not uploaded; existing chunks skipped | Content addressing makes resume a simple existence check and keeps sparse thin volumes cheap.
+- 8 | When is the snapshot lease epoch checked? | Before uploading any chunk and again at the conditional manifest write (If-None-Match for new, If-Match for existing), with one re-read on precondition failure | A stale writer uploads nothing and the manifest write is fenced.
+- 8 | Store without conditional writes? | Keep the epoch check and overwrite the manifest | The spec requires conditional writes only where the store supports them.
+- 4.6 | Restore validation? | Manifest layout and format version checked before download; each chunk hash and the whole-image sha256 verified after | Fails fast on corrupt manifests and catches non-blank targets.
+- 4.10 | SQLite durability settings? | WAL, synchronous=FULL, busy_timeout 5 s, migrations tracked in PRAGMA user_version | Operation and billing rows must survive power loss; the write rate is tiny.
+- 4.10 | u64 values in SQLite? | Values above i64::MAX are rejected | SQLite integers are signed.
+- 4.2 | Put with the same generation but different bytes? | Treated as an update | The control plane is authoritative.
+- 4.2 | Put for an instance marked for deletion? | Ignored unless its generation is higher | A replayed Put must not resurrect a deleted instance.
+- 10 | How are unique instance UIDs allocated? | uid_allocations table with a UNIQUE uid, lowest free in [base, base+count), released when the instance is removed | Guarantees no two instances share a UID.
+- 4.3 | finish_operation called twice? | First result wins | Replayed operations must return one stable result.
+- 4.5 | Can a referenced artifact be deleted? | The store refuses with ArtifactReferenced | Enforces "only unreferenced artifacts can be evicted" at the lowest layer.
+- 4.9 | Where does aggregator state live? | kv key usage/aggregator/<instance_id> as JSON, written after closed rows are inserted | A crash in between replays the same bucket ID, which INSERT OR IGNORE drops.
+- 4.9 | First sample or counter reset? | Count from zero (the full counter value) | Cgroups and TAPs are created fresh per VM.
+- 4.9 | Sample older than the open bucket? | Added to the open bucket | An already-written record ID never absorbs new usage.
+- 4.9 | Minutes without samples? | No record; the next delta lands in the next sample's bucket | Usage is never lost or invented.
+- 4.9 | Memory in usage records? | memory_mib_max and memory_mib_avg rounded up to whole MiB | Non-zero usage never reports as 0.
+- 4.9 | Usage after deletion? | forget closes the open bucket immediately and ignores samples up to that time for 600 s | Prevents double billing from a sampler racing deletion.
+- 4.9 | Outbox in-flight tracking? | In memory only; after restart all pending rows are resent with unchanged IDs | Deterministic IDs make resending safe.
+- 4.9 | Firecracker metrics semantics? | Each flushed line is per-flush deltas summed by the reader; billing uses cgroup io.stat and TAP counters | FC totals reset when the reader is recreated, so they are VMM metrics, not billing sources.
+- 4.9 | Network usage direction? | Reported from the guest's view (guest rx = host interface tx) | Usage is per instance.
+- 12 | Metrics endpoint? | GET/HEAD /metrics on loopback only, Prometheus text 0.0.4, histogram buckets 0.005–60 s | Section 10 allows only localhost metrics.
+- 5 | How does the agent learn that the full desired state is complete? | ControlMessage.desired (DesiredState) carries every instance spec and the network config in one message, always applied and resetting the control-seq watermark | Instances absent from it can be deleted safely, and a control plane restart with new sequence numbers still resyncs.
+- 5 | Direction of StreamLogs? | Client-streaming from agent to control plane (stream LogChunk → LogStreamSummary), triggered by RunOperation.logs | The agent dials out and accepts no inbound connections, so it must push logs.
+- 5 | Message numbering? | Each side numbers from 1 per sender across reconnects; seq 0 marks ack-only and unnumbered messages (Hello, Heartbeat, LeaseRenewal), which are never replayed | Time-sensitive messages are regenerated rather than replayed, and Hello must precede replayed messages.
+- 5 | Usage record acknowledgement? | Cumulative seq acks; usage rows sent in a message with seq ≤ ack are deleted | Avoids a separate ack message.
+- 6 | How is a deleted instance reported? | InstanceStatus with PHASE_DELETED after cleanup; PHASE_REJECTED when admission refuses a spec | The state diagram ends at [*] and admission rejection has no phase.
+- 10 | How does a node get its first certificate? | Enroll RPC: join token + CSR over server-authenticated TLS; rotation calls Enroll with the current client certificate and no token | Section 10 requires join token → CSR → certificate but the sketch has no RPC for it.
+- 4.8 | Guest-proto encoding? | Hand-derived prost messages with a 4-byte big-endian length prefix | Shared by host and guest with no build step.
+- 4.6 | Guest acknowledgement for world-consistent backups? | Added SnapshotPrepared (guest → host) and ResumeWrites (host → guest) | save-all flush → freeze → snapshot → resume needs an ack and a resume step.
+- 10 | How do secrets reach the jail? | Sent in the guest Configure message and written by the guest agent to a tmpfs at /run/quarry/secrets; Debug output prints names only | Works identically for Firecracker and gVisor and never touches host disk or logs.
+- 4.8 | Frame size limits? | Guest → host 16 KiB; host → guest 1 MiB | Configure carries env and secrets; guest input is untrusted and kept small.
+- 4.8 | Host-message limits? | instance_id ≤ 128 bytes; env names ≤ 256 bytes without '='; env values ≤ 32 KiB; server_command ≤ 256 args of ≤ 4096 bytes; console command ≤ 1024 bytes without control characters; Shutdown deadline ≤ 1 h | Bounded, validated input on both sides.
+- 4.8 | Guest-message limits? | tps 0–1000, mspt 0–60000, players ≤ 100000, heap ≤ 1 TiB, log line ≤ 4096 bytes, single-line fields without control characters | Guest numbers are display-only and must be sane.
+- 4.8 | Guest transport selection? | QUARRY_AGENT_TRANSPORT=vsock:5252 (Firecracker kernel command line, handed to init as env) or unix:/run/quarry/agent.sock (gVisor OCI env) | Section 4.8 says the transport comes from an environment variable set by quarryd.
