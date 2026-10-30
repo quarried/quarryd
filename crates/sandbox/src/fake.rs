@@ -28,6 +28,9 @@ const EXIT_CODE_FILE: &str = "exit_code";
 const MEMORY_TARGET_FILE: &str = "memory_target";
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Longest Unix socket path the platform accepts, excluding the terminating NUL.
+const MAX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
+const SHORT_SOCKET_PREFIX: &str = "quarryd-";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FakeConfig
@@ -68,13 +71,63 @@ impl FakePaths
             process: dir.join(PROCESS_FILE),
             pid: dir.join(PID_FILE),
             exit_code: dir.join(EXIT_CODE_FILE),
-            guest_socket: dir.join("agent.sock"),
+            guest_socket: guest_socket_path(&dir),
             console: dir.join(if ring { "console.ring" } else { "console.log" }),
             console_fifo: dir.join("console.fifo"),
             memory_target: dir.join(MEMORY_TARGET_FILE),
             dir,
         }
     }
+}
+
+/// The guest socket lives in the instance directory when the path fits in a Unix
+/// socket address. A state directory under a macOS home folder plus an instance ID
+/// does not fit in 104 bytes, so the socket then moves to a short name in the
+/// temporary directory, derived from the preferred path so that recovery after a
+/// restart finds the same socket.
+fn guest_socket_path(dir: &Path) -> PathBuf
+{
+    let preferred = dir.join("agent.sock");
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_BYTES
+    {
+        return preferred;
+    }
+    short_socket_path(&preferred)
+}
+
+fn short_socket_path(preferred: &Path) -> PathBuf
+{
+    use std::os::unix::ffi::OsStrExt;
+
+    std::env::temp_dir().join(format!(
+        "{SHORT_SOCKET_PREFIX}{:016x}.sock",
+        fnv1a(preferred.as_os_str().as_bytes())
+    ))
+}
+
+/// FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so socket names
+/// survive a quarryd upgrade.
+fn fnv1a(bytes: &[u8]) -> u64
+{
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Fails when even the short fallback socket path is too long, so a misconfigured
+/// host stops at startup instead of failing every instance launch.
+pub fn check_socket_paths() -> Result<(), SandboxError>
+{
+    let fallback = short_socket_path(Path::new(""));
+    if fallback.as_os_str().len() > MAX_SOCKET_PATH_BYTES
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "guest sockets need a path of at most {MAX_SOCKET_PATH_BYTES} bytes, but the \
+             temporary directory {} is too long; set TMPDIR to a shorter directory",
+            std::env::temp_dir().display()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -751,7 +804,14 @@ impl Sandbox for FakeSandbox
         {
             self.force_stop(&identity).await?;
         }
-        blocking(move || unit::remove_dir_if_exists(&paths.dir)).await
+        blocking(move || {
+            if !paths.guest_socket.starts_with(&paths.dir)
+            {
+                unit::remove_file_if_exists(&paths.guest_socket)?;
+            }
+            unit::remove_dir_if_exists(&paths.dir)
+        })
+        .await
     }
 }
 
@@ -1175,5 +1235,55 @@ mod tests
         cap_plain_log(&path, 4).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"6789");
         cap_plain_log(&directory.path().join("absent"), 4).unwrap();
+    }
+
+    fn long_state_dir(root: &Path) -> PathBuf
+    {
+        let dir = root.join("a".repeat(60)).join("b".repeat(60));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn guest_socket_stays_in_a_short_instance_directory()
+    {
+        let dir = Path::new("/var/lib/quarryd/fake-sandbox/mc-1");
+        assert_eq!(guest_socket_path(dir), dir.join("agent.sock"));
+    }
+
+    #[test]
+    fn guest_socket_moves_to_a_short_stable_path_when_too_long()
+    {
+        let dir = PathBuf::from("/").join("d".repeat(120)).join("mc-1");
+        let socket = guest_socket_path(&dir);
+        assert!(
+            socket.starts_with(std::env::temp_dir()),
+            "{}",
+            socket.display()
+        );
+        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
+        assert_eq!(guest_socket_path(&dir), socket);
+        assert_ne!(guest_socket_path(&dir.with_file_name("mc-2")), socket);
+    }
+
+    #[test]
+    fn guest_socket_paths_fit_on_this_host()
+    {
+        check_socket_paths().unwrap();
+    }
+
+    #[tokio::test]
+    async fn destroy_removes_a_relocated_guest_socket()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = sandbox(&long_state_dir(directory.path()), "sleep 30");
+        let handle = sandbox.launch(&sample_spec("relocated")).await.unwrap();
+        let socket = handle.record().guest_socket.clone();
+        assert!(!socket.starts_with(&handle.record().runtime_dir));
+        assert_eq!(sandbox.guest_socket_path("relocated"), socket);
+        fs::write(&socket, b"").unwrap();
+        sandbox.destroy(&handle).await.unwrap();
+        assert!(!socket.exists());
+        assert!(!handle.record().runtime_dir.exists());
     }
 }

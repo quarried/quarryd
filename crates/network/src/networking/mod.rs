@@ -539,7 +539,7 @@ impl Network for Networking
     async fn configure_public(&self, config: &PublicIpv4Config) -> Result<(), NetworkError>
     {
         let mut state = self.state.lock().await;
-        state.public.configure(config)?;
+        state.public.configure(config, true)?;
         self.apply_public(&mut state).await
     }
 

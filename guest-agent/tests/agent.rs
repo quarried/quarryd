@@ -67,6 +67,11 @@ impl Harness
 {
     fn start() -> Harness
     {
+        Harness::start_with_env(&[])
+    }
+
+    fn start_with_env(env: &[(&str, &str)]) -> Harness
+    {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("agent.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -78,6 +83,8 @@ impl Harness
             )
             .env("QUARRY_SECRETS_DIR", dir.path().join("secrets"))
             .env_remove("QUARRY_READY_PATTERN")
+            .env_remove("QUARRY_SERVER_BINARY")
+            .envs(env.iter().copied())
             .current_dir(dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -765,14 +772,12 @@ async fn an_empty_server_command_runs_the_env_command()
 }
 
 #[tokio::test]
-async fn a_missing_default_server_binary_fails_cleanly()
+async fn a_missing_server_binary_fails_cleanly()
 {
-    assert!(
-        !Path::new(guest_proto::SERVER_BINARY_PATH).exists(),
-        "this test expects no server binary at {} on the test host",
-        guest_proto::SERVER_BINARY_PATH
-    );
-    let mut harness = Harness::start();
+    // The override keeps this independent of whatever is installed at the default
+    // path on the test host.
+    let missing = "/nonexistent/quarry-server";
+    let mut harness = Harness::start_with_env(&[("QUARRY_SERVER_BINARY", missing)]);
     let mut host = harness.accept().await;
     let mut configure = harness.configure(&[], &[]);
     if let HostBody::Configure(configure) = &mut configure
@@ -781,9 +786,9 @@ async fn a_missing_default_server_binary_fails_cleanly()
     }
     host.send(configure).await;
     let line = host.log_containing("cannot start the server").await;
-    assert!(line.contains(guest_proto::SERVER_BINARY_PATH), "{line}");
+    assert!(line.contains(missing), "{line}");
     assert_eq!(harness.exit_code().await, Some(1));
-    assert!(harness.stderr().contains(guest_proto::SERVER_BINARY_PATH));
+    assert!(harness.stderr().contains(missing));
     assert!(!harness.dir.path().join("quarry.toml").exists());
 }
 

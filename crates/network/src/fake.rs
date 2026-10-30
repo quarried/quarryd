@@ -322,7 +322,8 @@ impl Network for FakeNetwork
             FakeCall::ConfigurePublic(config.clone()),
             FakeOperation::ConfigurePublic,
         )?;
-        state.persisted.public.configure(config)?;
+        // Nothing is routed through an uplink here, so a pool does not need one.
+        state.persisted.public.configure(config, false)?;
         self.apply_public(&mut state)
     }
 

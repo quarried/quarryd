@@ -692,3 +692,15 @@ async fn per_source_rate_limit_is_shared_across_instance_listeners()
     tokio::time::sleep(Duration::from_millis(110)).await;
     assert!(login(fake.responder_address("a").unwrap()).await["text"].is_string());
 }
+
+#[tokio::test]
+async fn fake_network_accepts_a_public_pool_without_an_uplink()
+{
+    let fake = FakeNetwork::new(None).unwrap();
+    fake.configure_public(&PublicIpv4Config {
+        uplink_interface: String::new(),
+        ..config(PublicIpv4Arp::default())
+    })
+    .await
+    .unwrap();
+}

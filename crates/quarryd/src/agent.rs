@@ -119,6 +119,7 @@ async fn build_sandbox(config: &Config) -> Result<Arc<dyn Sandbox>>
                 .fake_program
                 .clone()
                 .context("sandbox.fake_program is required for the fake backend")?;
+            sandbox::fake::check_socket_paths()?;
             Arc::new(sandbox::fake::FakeSandbox::new(sandbox::fake::FakeConfig {
                 state_dir: config.state_dir.join("fake-sandbox"),
                 program,

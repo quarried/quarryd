@@ -52,9 +52,15 @@ impl From<&PublicBinding> for RetiredBinding
 
 impl PublicState
 {
-    pub fn configure(&mut self, config: &PublicIpv4Config) -> Result<(), NetworkError>
+    /// `require_uplink` is false only for backends that never route the pool through
+    /// a host interface, such as the fake network used on development hosts.
+    pub fn configure(
+        &mut self,
+        config: &PublicIpv4Config,
+        require_uplink: bool,
+    ) -> Result<(), NetworkError>
     {
-        validate_config(config)?;
+        validate_config(config, require_uplink)?;
         let mut updated = self.clone();
         updated.config = config.clone();
         for (instance_id, binding) in &self.bindings
@@ -203,15 +209,16 @@ impl PublicState
     }
 }
 
-fn validate_config(config: &PublicIpv4Config) -> Result<(), NetworkError>
+fn validate_config(config: &PublicIpv4Config, require_uplink: bool) -> Result<(), NetworkError>
 {
-    if !config.pool.is_empty()
-        && (config.uplink_interface.is_empty()
-            || config.uplink_interface.len() > crate::IFNAMSIZ_MAX_LEN
-            || !config
-                .uplink_interface
+    let uplink = &config.uplink_interface;
+    let missing = uplink.is_empty() && require_uplink;
+    let malformed = !uplink.is_empty()
+        && (uplink.len() > crate::IFNAMSIZ_MAX_LEN
+            || !uplink
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b)))
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b)));
+    if !config.pool.is_empty() && (missing || malformed)
     {
         return Err(NetworkError::InvalidNodeNetwork(
             "a public IPv4 pool requires a valid uplink_interface".to_string(),
@@ -244,4 +251,49 @@ fn pool_entry(entry: &str) -> Result<(Ipv4Addr, u8), NetworkError>
         return Err(invalid());
     }
     Ok((address, prefix))
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn pool_config(uplink_interface: &str) -> PublicIpv4Config
+    {
+        PublicIpv4Config {
+            pool: vec!["203.0.113.8/30".to_string()],
+            uplink_interface: uplink_interface.to_string(),
+            arp: Default::default(),
+        }
+    }
+
+    #[test]
+    fn public_pool_requires_an_uplink_when_routed()
+    {
+        let error = PublicState::default()
+            .configure(&pool_config(""), true)
+            .unwrap_err();
+        assert!(error.to_string().contains("uplink_interface"), "{error}");
+    }
+
+    #[test]
+    fn public_pool_without_an_uplink_is_accepted_when_not_routed()
+    {
+        PublicState::default()
+            .configure(&pool_config(""), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn public_pool_rejects_a_malformed_uplink_either_way()
+    {
+        for require_uplink in [true, false]
+        {
+            assert!(
+                PublicState::default()
+                    .configure(&pool_config("eth0;rm -rf /"), require_uplink)
+                    .is_err()
+            );
+        }
+    }
 }

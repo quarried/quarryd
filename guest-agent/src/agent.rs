@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use guest_proto::{
     Configure, ConsoleOutput, GuestBody, GuestMessage, Health, HostBody, HostMessage, Log,
-    MAX_ERROR_BYTES, MAX_HEAP_BYTES, MAX_LOG_LINE_BYTES, RateLimiter, Ready, SERVER_BINARY_PATH,
-    ShutdownComplete, SnapshotPrepared,
+    MAX_ERROR_BYTES, MAX_HEAP_BYTES, MAX_LOG_LINE_BYTES, RateLimiter, Ready, ShutdownComplete,
+    SnapshotPrepared,
 };
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -489,8 +489,9 @@ impl Agent
         else
         {
             let data_dir = server::data_dir();
+            let binary = self.settings.server_binary.clone();
             if let Err(error) = world::prepare(
-                SERVER_BINARY_PATH,
+                &binary,
                 &data_dir,
                 &configure.instance_id,
                 &configure.env,
@@ -501,7 +502,7 @@ impl Agent
             {
                 return Some(self.fail_start(&error));
             }
-            world::default_command(SERVER_BINARY_PATH, &data_dir)
+            world::default_command(&binary, &data_dir)
         };
         match server::spawn(
             &argv,
