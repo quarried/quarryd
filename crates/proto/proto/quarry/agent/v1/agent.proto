@@ -2,356 +2,578 @@ syntax = "proto3";
 
 package quarry.agent.v1;
 
+// Control-plane endpoint that node agents dial out to. All RPCs run over mTLS.
 service AgentGateway
 {
+    // Long-lived bidirectional control stream. The agent sends `Hello` first;
+    // the control plane replays unacknowledged messages, then sends the full
+    // `DesiredState`, then incremental updates.
     rpc Connect(stream AgentMessage) returns (stream ControlMessage);
+    // Agent-initiated log upload for a `StreamLogs` operation. Kept separate
+    // from `Connect` so a slow log tail never delays state updates.
     rpc StreamLogs(stream LogChunk) returns (LogStreamSummary);
+    // Exchanges a one-time join token (or a still-valid client certificate,
+    // for rotation) and a CSR for a short-lived client certificate.
     rpc Enroll(EnrollRequest) returns (EnrollResponse);
 }
 
+// Message sent by the agent on the `Connect` stream.
 message AgentMessage
 {
+    // Sender sequence number, strictly increasing per agent from 1 across
+    // reconnects. Zero marks an ack-only or unnumbered message.
     uint64 seq = 1;
+    // Cumulative acknowledgement: highest control-plane `seq` processed.
     uint64 ack = 2;
+    // Payload. Absent on ack-only messages.
     oneof body
     {
+        // First message on every stream; always sent with `seq = 0`.
         Hello hello = 10;
+        // Periodic liveness and capacity report.
         Heartbeat heartbeat = 11;
+        // Observed state of one instance.
         InstanceStatus status = 12;
+        // Raw usage records for billing.
         UsageBatch usage = 13;
+        // Result of a `RunOperation`.
         OperationResult op_result = 14;
+        // Lease renewal request for held leases.
         LeaseRenewal lease = 15;
     }
 }
 
+// Message sent by the control plane on the `Connect` stream.
 message ControlMessage
 {
+    // Sender sequence number, strictly increasing per node from 1 across
+    // reconnects. Zero marks an ack-only or unnumbered message.
     uint64 seq = 1;
+    // Cumulative acknowledgement: highest agent `seq` received.
     uint64 ack = 2;
+    // Payload. Absent on ack-only messages.
     oneof body
     {
+        // Create or update one instance (full spec and generation).
         PutInstance put = 10;
+        // Delete one instance.
         DeleteInstance delete = 11;
+        // One-shot imperative operation.
         RunOperation op = 12;
+        // Node network configuration.
         NetworkConfig network = 13;
+        // Lease grant or renewal for one instance.
         LeaseGrant lease = 14;
+        // Self-update instruction.
         AgentUpdate update = 15;
+        // Full desired state for the node, replacing any previous one.
         DesiredState desired = 16;
     }
 }
 
+// Sandbox backend an instance requires.
 enum Isolation
 {
+    // Not specified.
     ISOLATION_UNSPECIFIED = 0;
+    // Firecracker microVM with jailer (requires KVM).
     ISOLATION_FIRECRACKER = 1;
+    // gVisor `runsc` sandbox.
     ISOLATION_GVISOR = 2;
 }
 
+// What to do when an instance exits.
 enum RestartPolicy
 {
+    // Not specified.
     RESTART_POLICY_UNSPECIFIED = 0;
+    // Always restart.
     RESTART_POLICY_ALWAYS = 1;
+    // Restart with backoff only after a failure.
     RESTART_POLICY_ON_FAILURE = 2;
+    // Never restart.
     RESTART_POLICY_NEVER = 3;
 }
 
+// Desired run state of an instance.
 enum RunState
 {
+    // Not specified.
     RUN_STATE_UNSPECIFIED = 0;
+    // The instance should be running.
     RUN_STATE_RUNNING = 1;
+    // The instance should exist but be stopped.
     RUN_STATE_STOPPED = 2;
 }
 
+// Lifecycle phase of an instance as observed by the agent.
 enum Phase
 {
+    // Not specified.
     PHASE_UNSPECIFIED = 0;
+    // Spec received, not yet admitted.
     PHASE_PENDING = 1;
+    // Fetching image, creating volume and network.
     PHASE_PREPARING = 2;
+    // Sandbox started, waiting for the guest agent.
     PHASE_BOOTING = 3;
+    // Guest agent connected, waiting for the server to report ready.
     PHASE_STARTING = 4;
+    // Server reported ready.
     PHASE_RUNNING = 5;
+    // Graceful shutdown in progress.
     PHASE_STOPPING = 6;
+    // Sandbox stopped; resources retained.
     PHASE_STOPPED = 7;
+    // Instance failed; see `reason`.
     PHASE_FAILED = 8;
+    // Resources are being released.
     PHASE_DELETING = 9;
+    // All resources released.
     PHASE_DELETED = 10;
+    // Admission check refused the spec; see `reason`.
     PHASE_REJECTED = 11;
 }
 
+// Amount of compute resources.
 message Resources
 {
+    // Virtual CPUs.
     uint32 vcpus = 1;
+    // Memory in MiB.
     uint64 memory_mib = 2;
+    // Disk in GiB.
     uint64 disk_gib = 3;
 }
 
+// Host capabilities detected at agent startup.
 message Capabilities
 {
+    // Whether `/dev/kvm` is available.
     bool kvm = 1;
+    // Isolation backends this node can run.
     repeated Isolation isolations = 2;
+    // CPU architecture, for example `x86_64` or `aarch64`.
     string arch = 3;
+    // WireGuard public key of this node for the regional mesh.
     string wireguard_public_key = 4;
 }
 
+// One instance known to the agent.
 message InventoryEntry
 {
+    // Instance identifier.
     string instance_id = 1;
+    // Generation of the spec the instance currently reflects.
     uint64 observed_generation = 2;
+    // Current phase.
     Phase phase = 3;
 }
 
+// Node resources and instances reported in `Hello`.
 message Inventory
 {
+    // Total host resources.
     Resources total = 1;
+    // Total minus host reservation.
     Resources allocatable = 2;
+    // Instances present on the node.
     repeated InventoryEntry instances = 3;
 }
 
+// First message on every `Connect` stream.
 message Hello
 {
+    // Node identity (certificate common name).
     string node_id = 1;
+    // Running agent version.
     string agent_version = 2;
+    // Detected host capabilities.
     Capabilities capabilities = 3;
+    // Resources and instances present on the node.
     Inventory inventory = 4;
 }
 
+// Current load on the node.
 message Load
 {
+    // Number of instances in the running phase.
     uint32 running_instances = 1;
+    // Resources committed to admitted instances.
     Resources committed = 2;
+    // One-minute load average.
     double cpu_load_1m = 3;
+    // Thin pool data usage in percent.
     double thin_pool_used_percent = 4;
+    // Whether the node is draining and refuses new instances.
     bool draining = 5;
 }
 
+// Periodic liveness and capacity report.
 message Heartbeat
 {
+    // Total minus host reservation.
     Resources allocatable = 1;
+    // Current load.
     Load load = 2;
+    // Agent wall-clock time when sent, in Unix milliseconds.
     uint64 sent_at_unix_ms = 3;
 }
 
+// Observed state of one instance.
 message InstanceStatus
 {
+    // Instance identifier.
     string id = 1;
+    // Generation of the spec the instance currently reflects.
     uint64 observed_generation = 2;
+    // Current phase.
     Phase phase = 3;
+    // Human-readable reason for the phase, mainly for failures and rejections.
     string reason = 4;
+    // Lease epoch the instance runs under.
     uint64 lease_epoch = 5;
+    // Private IP assigned to the guest.
     string guest_ip = 6;
 }
 
+// Raw usage of one instance over one bucket.
 message UsageRecord
 {
+    // Deterministic identifier (`instance_id` + bucket start) for deduplication.
     string id = 1;
+    // Instance identifier.
     string instance_id = 2;
+    // Bucket start in Unix seconds.
     int64 bucket_start_unix = 3;
+    // Bucket length in seconds.
     uint32 bucket_seconds = 4;
+    // CPU time consumed, in microseconds.
     uint64 cpu_usec = 5;
+    // Peak memory in MiB.
     uint64 memory_mib_max = 6;
+    // Average memory in MiB.
     uint64 memory_mib_avg = 7;
+    // Bytes read from disk.
     uint64 disk_read_bytes = 8;
+    // Bytes written to disk.
     uint64 disk_write_bytes = 9;
+    // Network bytes received by the instance.
     uint64 net_rx_bytes = 10;
+    // Network bytes sent by the instance.
     uint64 net_tx_bytes = 11;
 }
 
+// Batch of usage records from the outbox.
 message UsageBatch
 {
+    // Records, deleted from the outbox once acknowledged.
     repeated UsageRecord records = 1;
 }
 
+// Outcome of an operation.
 enum OperationStatus
 {
+    // Not specified.
     OPERATION_STATUS_UNSPECIFIED = 0;
+    // The operation completed successfully.
     OPERATION_STATUS_SUCCEEDED = 1;
+    // The operation failed; see `message`.
     OPERATION_STATUS_FAILED = 2;
 }
 
+// Result of a `RunOperation`, replayed from the stored result on duplicates.
 message OperationResult
 {
+    // Operation identifier chosen by the control plane.
     string op_id = 1;
+    // Outcome.
     OperationStatus status = 2;
+    // Human-readable detail.
     string message = 3;
+    // Operation-specific result data.
     bytes payload = 4;
 }
 
+// Request to renew the leases the agent holds.
 message LeaseRenewal
 {
+    // Leases currently held.
     repeated LeaseHeld leases = 1;
 }
 
+// One lease held by the agent.
 message LeaseHeld
 {
+    // Instance identifier.
     string instance_id = 1;
+    // Lease epoch.
     uint64 epoch = 2;
+    // Time left before the lease expires, in milliseconds.
     uint64 remaining_ms = 3;
 }
 
+// Reference to a signed, content-addressed artifact in object storage.
 message ArtifactRef
 {
+    // SHA-256 digest of the artifact contents.
     string digest = 1;
+    // Object storage key.
     string key = 2;
+    // Object storage key of the detached signature.
     string signature_key = 3;
+    // Size of the artifact in bytes.
     uint64 size_bytes = 4;
 }
 
+// Reference to a volume snapshot in object storage.
 message SnapshotRef
 {
+    // Object storage key of the snapshot manifest.
     string manifest_key = 1;
 }
 
+// One writable disk of an instance.
 message DiskSpec
 {
+    // Disk name, unique within the instance.
     string name = 1;
+    // Size in GiB.
     uint64 size_gib = 2;
+    // Snapshot to restore the disk from when it is first created.
     SnapshotRef restore_from = 3;
 }
 
+// Network settings of one instance.
 message InstanceNetwork
 {
+    // World the instance belongs to, used to tag network rules.
     string world_id = 1;
+    // Egress bandwidth limit in Mbit/s.
     uint32 egress_mbit = 2;
+    // Ports the edge proxy forwards to the instance.
     repeated uint32 ports = 3;
 }
 
+// Lease attached to an instance spec.
 message Lease
 {
+    // Lease epoch.
     uint64 epoch = 1;
+    // Lease time-to-live in milliseconds.
     uint64 ttl_ms = 2;
 }
 
+// Desired state of one instance.
 message InstanceSpec
 {
+    // Instance identifier.
     string id = 1;
+    // Spec generation; increases on every change.
     uint64 generation = 2;
+    // Required sandbox backend.
     Isolation isolation = 3;
+    // Root filesystem image.
     ArtifactRef image = 4;
+    // Guest kernel (Firecracker only).
     ArtifactRef kernel = 5;
+    // Virtual CPUs.
     uint32 vcpus = 6;
+    // Memory in MiB.
     uint64 memory_mib = 7;
+    // Writable disks.
     repeated DiskSpec disks = 8;
+    // Network settings.
     InstanceNetwork network = 9;
+    // Environment passed to the server.
     map<string, string> env = 10;
+    // Restart policy.
     RestartPolicy restart_policy = 11;
+    // Lease the instance runs under.
     Lease lease = 12;
+    // Desired run state.
     RunState run_state = 13;
+    // Secrets written to a tmpfs inside the sandbox; never logged.
     map<string, bytes> secrets = 14;
+    // Graceful shutdown deadline in seconds.
     uint32 stop_deadline_seconds = 15;
+    // Pin vCPU threads to host CPUs.
     bool cpu_pinning = 16;
+    // Reclaim memory with the balloon while the server is idle.
     bool balloon_idle_reclaim = 17;
+    // Minutes without players before idle reclaim starts.
     uint32 idle_reclaim_minutes = 18;
 }
 
+// Create or update one instance.
 message PutInstance
 {
+    // Full desired spec.
     InstanceSpec spec = 1;
 }
 
+// Delete one instance and release its resources.
 message DeleteInstance
 {
+    // Instance identifier.
     string id = 1;
 }
 
+// Full desired state for the node. Instances not listed are deleted.
 message DesiredState
 {
+    // Every instance that should exist on the node.
     repeated InstanceSpec instances = 1;
+    // Node network configuration.
     NetworkConfig network = 2;
 }
 
+// Take a world-consistent volume snapshot and upload it.
 message SnapshotNow
 {
+    // Object storage prefix to upload the snapshot under.
     string destination_prefix = 1;
 }
 
+// Upload instance logs through the `StreamLogs` RPC.
 message StreamLogs
 {
+    // Number of bytes from the end of the log to start with.
     uint64 tail_bytes = 1;
+    // Keep streaming new output after the tail.
     bool follow = 2;
 }
 
+// Send a command to the server console.
 message SendConsoleCommand
 {
+    // Console command, without a trailing newline.
     string command = 1;
 }
 
+// Enable or disable draining of the node.
 message Drain
 {
+    // Whether the node should drain.
     bool enabled = 1;
 }
 
+// Collect a diagnostics bundle.
 message CollectDiagnostics
 {
 }
 
+// One-shot imperative operation, deduplicated by `op_id`.
 message RunOperation
 {
+    // Operation identifier chosen by the control plane.
     string op_id = 1;
+    // Target instance; empty for node-level operations.
     string instance_id = 2;
+    // Operation kind.
     oneof kind
     {
+        // Take a snapshot now.
         SnapshotNow snapshot = 10;
+        // Stream logs.
         StreamLogs logs = 11;
+        // Send a console command.
         SendConsoleCommand console = 12;
+        // Drain the node.
         Drain drain = 13;
+        // Collect diagnostics.
         CollectDiagnostics diagnostics = 14;
     }
 }
 
+// Peer in the regional WireGuard mesh.
 message WireGuardPeer
 {
+    // Peer public key.
     string public_key = 1;
+    // Peer endpoint as `host:port`.
     string endpoint = 2;
+    // CIDRs routed to the peer.
     repeated string allowed_ips = 3;
 }
 
+// Node network configuration.
 message NetworkConfig
 {
+    // Private subnet assigned to the node, in CIDR notation.
     string subnet = 1;
+    // Region the node belongs to.
     string region = 2;
+    // WireGuard listen port.
     uint32 wireguard_listen_port = 3;
+    // Address of this node on the WireGuard mesh, in CIDR notation.
     string wireguard_address = 4;
+    // Mesh peers.
     repeated WireGuardPeer peers = 5;
 }
 
+// Lease grant or renewal for one instance.
 message LeaseGrant
 {
+    // Instance identifier.
     string instance_id = 1;
+    // Lease epoch.
     uint64 epoch = 2;
+    // Time-to-live from receipt, in milliseconds.
     uint64 ttl_ms = 3;
 }
 
+// Instruction to update the agent binary.
 message AgentUpdate
 {
+    // Target version.
     string version = 1;
+    // SHA-256 digest of the binary.
     string digest = 2;
+    // Object storage key of the binary.
     string key = 3;
+    // Object storage key of the detached signature.
     string signature_key = 4;
 }
 
+// Chunk of log data for a `StreamLogs` operation.
 message LogChunk
 {
+    // Operation identifier.
     string op_id = 1;
+    // Instance identifier.
     string instance_id = 2;
+    // Raw log bytes.
     bytes data = 3;
+    // Set on the final chunk.
     bool eof = 4;
 }
 
+// Response to a `StreamLogs` upload.
 message LogStreamSummary
 {
+    // Total log bytes received.
     uint64 bytes_received = 1;
 }
 
+// Certificate enrollment or rotation request.
 message EnrollRequest
 {
+    // Node identity requested.
     string node_id = 1;
+    // One-time join token; empty when rotating with a valid client certificate.
     string join_token = 2;
+    // PEM-encoded certificate signing request.
     string csr_pem = 3;
 }
 
+// Issued client certificate.
 message EnrollResponse
 {
+    // PEM-encoded client certificate.
     string certificate_pem = 1;
+    // PEM-encoded CA certificate to pin.
     string ca_pem = 2;
+    // Certificate expiry in Unix seconds.
     uint64 expires_at_unix = 3;
 }

@@ -6,3 +6,16 @@ license.workspace = true
 publish = false
 
 [dependencies]
+anyhow = { workspace = true }
+proto = { workspace = true }
+rcgen = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+x509-parser = "0.18"
+
+[dev-dependencies]
+tempfile = { workspace = true }
