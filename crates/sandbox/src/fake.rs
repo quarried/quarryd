@@ -389,6 +389,9 @@ impl FakeSandbox
         let script = wrapper_script(paths, writer.as_deref())?;
         let mut command = tokio::process::Command::new("/bin/sh");
         command
+            // Each instance runs in its own directory, as a guest has its own filesystem,
+            // so programs that write relative to their working directory stay apart.
+            .current_dir(&paths.dir)
             .arg("-c")
             .arg(script)
             .arg("quarry-fake-sandbox")
@@ -1285,5 +1288,20 @@ mod tests
         sandbox.destroy(&handle).await.unwrap();
         assert!(!socket.exists());
         assert!(!handle.record().runtime_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn the_program_runs_in_the_instance_directory()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = sandbox(directory.path(), "pwd -P; exit 0");
+        let handle = sandbox.launch(&sample_spec("cwd")).await.unwrap();
+        wait_until_not_running(&sandbox, &handle).await;
+        let console =
+            String::from_utf8_lossy(&read_console(&handle.record().console_path).unwrap())
+                .into_owned();
+        let expected = handle.record().runtime_dir.canonicalize().unwrap();
+        assert_eq!(console.trim(), expected.display().to_string());
+        sandbox.destroy(&handle).await.unwrap();
     }
 }
