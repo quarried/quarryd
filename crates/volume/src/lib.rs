@@ -1,5 +1,6 @@
 mod error;
 mod file;
+mod images;
 mod lvm;
 mod snapshot;
 mod volumes;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub use error::VolumeError;
 pub use file::FileVolume;
+pub use images::{ArtifactDescriptor, ArtifactKind, CachedArtifact, ImageCache};
 pub use lvm::LvmThin;
 pub use snapshot::{ChunkRef, MANIFEST_FORMAT_VERSION, SnapshotManifest, SnapshotStore};
 pub use volumes::{CRITICAL_PERCENT, PoolAlert, PoolStatus, Volumes, WARNING_PERCENT};

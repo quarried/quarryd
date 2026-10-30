@@ -528,7 +528,7 @@ async fn hash_prefix(path: &Path, length: u64) -> Result<String, VolumeError>
     Ok(to_hex(&hasher.finalize()))
 }
 
-fn unix_now() -> i64
+pub(crate) fn unix_now() -> i64
 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -536,7 +536,7 @@ fn unix_now() -> i64
         .unwrap_or(0)
 }
 
-fn to_hex(bytes: &[u8]) -> String
+pub(crate) fn to_hex(bytes: &[u8]) -> String
 {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut hex = String::with_capacity(bytes.len() * 2);

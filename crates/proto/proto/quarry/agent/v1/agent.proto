@@ -534,6 +534,8 @@ message AgentUpdate
     string key = 3;
     // Object storage key of the detached signature.
     string signature_key = 4;
+    // Exact size of the binary in bytes.
+    uint64 size_bytes = 5;
 }
 
 // Chunk of log data for a `StreamLogs` operation.

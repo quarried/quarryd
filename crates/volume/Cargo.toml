@@ -9,10 +9,12 @@ publish = false
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+minisign-verify = { workspace = true }
 object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+store = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -20,3 +22,4 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+minisign = "0.10"

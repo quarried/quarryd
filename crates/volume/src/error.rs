@@ -83,6 +83,32 @@ pub enum VolumeError
     {
         chunk_size: u64
     },
+    #[error("invalid artifact digest {digest:?}; expected 64 lowercase hex characters")]
+    InvalidDigest
+    {
+        digest: String
+    },
+    #[error("invalid minisign public key: {0}")]
+    InvalidPublicKey(#[source] minisign_verify::Error),
+    #[error("signature {key} does not verify: {source}")]
+    Signature
+    {
+        key: String,
+        #[source]
+        source: minisign_verify::Error,
+    },
+    #[error("artifact digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch
+    {
+        expected: String, actual: String
+    },
+    #[error("artifact size mismatch: expected {expected} bytes, got {actual}")]
+    SizeMismatch
+    {
+        expected: u64, actual: u64
+    },
+    #[error(transparent)]
+    Store(#[from] store::StoreError),
     #[error("background task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
 }

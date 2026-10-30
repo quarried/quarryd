@@ -227,7 +227,7 @@ impl Volume for FileVolume
     }
 }
 
-async fn remove_if_present(path: &Path) -> Result<(), VolumeError>
+pub(crate) async fn remove_if_present(path: &Path) -> Result<(), VolumeError>
 {
     match tokio::fs::remove_file(path).await
     {
