@@ -41,3 +41,10 @@
 - 4.8 | Host-message limits? | instance_id ≤ 128 bytes; env names ≤ 256 bytes without '='; env values ≤ 32 KiB; server_command ≤ 256 args of ≤ 4096 bytes; console command ≤ 1024 bytes without control characters; Shutdown deadline ≤ 1 h | Bounded, validated input on both sides.
 - 4.8 | Guest-message limits? | tps 0–1000, mspt 0–60000, players ≤ 100000, heap ≤ 1 TiB, log line ≤ 4096 bytes, single-line fields without control characters | Guest numbers are display-only and must be sane.
 - 4.8 | Guest transport selection? | QUARRY_AGENT_TRANSPORT=vsock:5252 (Firecracker kernel command line, handed to init as env) or unix:/run/quarry/agent.sock (gVisor OCI env) | Section 4.8 says the transport comes from an environment variable set by quarryd.
+- 4.5 | Order of artifact checks? | Fetch the detached minisign signature first, then stream the download through sha256 and minisign together; digest checked before signature | One pass over the file, and missing signatures fail before downloading.
+- 4.5 | Legacy (non-prehashed) minisign signatures? | Refused | minisign-verify verifies only prehashed signatures when streaming; current minisign signs prehashed by default.
+- 4.5 | Artifact size? | Exact size_bytes required; downloads abort once they exceed it (AgentUpdate gained size_bytes) | A bad object cannot fill the disk.
+- 10 | Digest format? | Exactly 64 lowercase hex characters | Content addressing and protection against path traversal.
+- 4.5 | What is a cache hit? | Verified row plus a file of the recorded size at <dir>/<digest>; anything else is re-downloaded | Corrupted or missing cache files heal themselves.
+- 4.5 | When does eviction run? | After a download that pushes the cache over capacity, skipping artifacts being downloaded or referenced | LRU over unreferenced artifacts only, as 4.5 requires.
+- 4.5 | Order of reference and fetch? | The supervisor acquires the instance's reference before ensure | Eviction can never remove an artifact between download and boot.
